@@ -119,21 +119,34 @@ class CollectorState(Base):
 
 
 class AppUser(Base):
-    """Локальная учётка приложения, привязанная к личности в AD. Пароль здесь
-    никогда не хранится — вход проверяется прямым bind-ом к AD на каждый логин
-    (см. printaudit.security.auth)."""
+    """Локальная учётка приложения — либо привязанная к личности в AD (вход
+    прямым bind-ом к AD на каждый логин, пароль никогда не хранится), либо
+    полностью локальная (auth_provider="local", пароль — только как
+    Argon2id-хэш). См. printaudit.security.local_auth / printaudit.ad.client."""
 
     __tablename__ = "app_users"
 
     id = Column(Integer, primary_key=True)
     ad_sid = Column(String(200), unique=True, nullable=True)
     ad_object_guid = Column(String(64), unique=True, nullable=True)
-    # DOMAIN\sam, в нижнем регистре — см. printaudit.ad_normalize.normalize_login
+    # DOMAIN\sam (AD) или просто логин в нижнем регистре (local) —
+    # см. printaudit.ad_normalize.normalize_login
     login_normalized = Column(String(200), unique=True, nullable=False, index=True)
     display_name = Column(String(300), nullable=True)
     email = Column(String(300), nullable=True)
     role = Column(String(20), nullable=False)  # superadmin | admin | viewer
     is_active = Column(Boolean, nullable=False, default=True)
+
+    # "local" | "ad" — какой провайдер проверяет вход для этой учётки.
+    auth_provider = Column(String(10), nullable=False, default="ad")
+    # Argon2id-хэш (см. printaudit.security.passwords) — NULL для auth_provider="ad".
+    password_hash = Column(String(300), nullable=True)
+    # True сразу после создания админом/bootstrap с временным паролем —
+    # require_login принудительно перенаправляет на /change-password, пока не False.
+    must_change_password = Column(Boolean, nullable=False, default=False)
+    failed_login_count = Column(Integer, nullable=False, default=0)
+    locked_until = Column(DateTime, nullable=True)
+    password_changed_at = Column(DateTime, nullable=True)
 
     assigned_by_id = Column(Integer, ForeignKey("app_users.id"), nullable=True)
     assigned_at = Column(DateTime, nullable=False, default=_utcnow)

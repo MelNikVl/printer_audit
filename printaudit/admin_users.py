@@ -5,12 +5,15 @@
     вызвано действие;
   - быть тестируемыми без поднятия FastAPI/HTTP.
 """
-from typing import Optional
+import secrets
+from typing import Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from printaudit import audit, roles
+from printaudit.ad_normalize import normalize_login
 from printaudit.models import AppUser
+from printaudit.security.passwords import hash_password
 from printaudit.timeutil import utcnow
 
 
@@ -114,6 +117,64 @@ def upsert_admin_assignment(
         ip_address=ip_address,
     )
     return existing
+
+
+def generate_temporary_password() -> str:
+    """~22 случайных URL-safe символа — заведомо длиннее MIN_PASSWORD_LENGTH,
+    показывается администратору РОВНО ОДИН РАЗ в flash-сообщении и никогда
+    не сохраняется в открытом виде (только Argon2id-хэш в AppUser)."""
+    return secrets.token_urlsafe(16)
+
+
+def create_local_user(
+    session: Session,
+    *,
+    actor: AppUser,
+    login: str,
+    role: str,
+    display_name: Optional[str] = None,
+    email: Optional[str] = None,
+    ip_address: Optional[str] = None,
+) -> Tuple[AppUser, str]:
+    """Создаёт НОВОГО локального пользователя (auth_provider="local") со
+    случайным временным паролем и must_change_password=True. Возвращает
+    (AppUser, временный_пароль) — пароль нужно показать актёру ОДИН раз
+    (например, во flash-сообщении редиректа) и никогда не логировать/не
+    сохранять отдельно от Argon2id-хэша. Не коммитит."""
+    _require_known_role(role)
+    if actor.role == roles.ADMIN and role == roles.SUPERADMIN:
+        raise AdminActionError("Роль admin не может назначать роль superadmin — это может только superadmin.")
+
+    login_normalized = normalize_login(login)
+    if session.query(AppUser).filter_by(login_normalized=login_normalized).first():
+        raise AdminActionError(f"Пользователь с логином «{login_normalized}» уже существует.")
+
+    temp_password = generate_temporary_password()
+    now = utcnow()
+    user = AppUser(
+        login_normalized=login_normalized,
+        display_name=display_name or None,
+        email=email or None,
+        role=role,
+        is_active=True,
+        auth_provider="local",
+        password_hash=hash_password(temp_password),
+        must_change_password=True,
+        assigned_by_id=actor.id,
+        assigned_at=now,
+    )
+    session.add(user)
+    session.flush()
+    audit.record(
+        session,
+        actor_app_user_id=actor.id,
+        action="admin.create_local_user",
+        object_type="app_user",
+        object_id=user.id,
+        new_value={"login_normalized": login_normalized, "role": role},
+        ip_address=ip_address,
+    )
+    return user, temp_password
 
 
 def disable_admin(session: Session, *, actor: AppUser, target: AppUser, ip_address: Optional[str] = None) -> None:

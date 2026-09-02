@@ -8,6 +8,7 @@ python-multipart==0.0.9
 alembic==1.13.3
 ldap3==2.9.1
 python-dotenv==1.0.1
+argon2-cffi==23.1.0
 
 # Опционально, только если БД = PostgreSQL (см. config/config.yaml -> db.url)
 # psycopg2-binary==2.9.9
