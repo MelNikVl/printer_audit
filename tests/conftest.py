@@ -64,24 +64,14 @@ def _reset_app_modules():
             sys.modules.pop(name, None)
 
 
-@pytest.fixture
-def app_env(tmp_path, monkeypatch):
-    """Изолированная конфигурация + пустая SQLite БД на каждый тест.
-
-    Возвращает свежесобранный модуль `printaudit.database` (с engine,
-    указывающим на временную БД этого теста) — импортировать
-    `printaudit.*`/`collector.*` внутри теста нужно ПОСЛЕ вызова этой fixture,
-    иначе получите модули, привязанные к чужой (например, дефолтной сессионной)
-    БД из кэша sys.modules.
-    """
-    db_path = tmp_path / "test.db"
+def _write_test_config(tmp_path, db_path, site_code="TEST"):
     csv_path = tmp_path / "users_departments.csv"
     csv_path.write_text("user_name,department_name,cost_center_code\n", encoding="utf-8")
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
         f"""
-site_code: "TEST"
+site_code: "{site_code}"
 db:
   url: "sqlite:///{db_path.as_posix()}"
 paths:
@@ -104,6 +94,26 @@ default_price_per_page_color: 40
 """,
         encoding="utf-8",
     )
+    return cfg_path
+
+
+@pytest.fixture
+def app_env(tmp_path, monkeypatch):
+    """Изолированная конфигурация + пустая SQLite БД (со ВСЕМИ таблицами,
+    созданными напрямую через Base.metadata.create_all, без прогона через
+    Alembic) на каждый тест.
+
+    Возвращает свежесобранный модуль `printaudit.database` (с engine,
+    указывающим на временную БД этого теста) — импортировать
+    `printaudit.*`/`collector.*` внутри теста нужно ПОСЛЕ вызова этой fixture,
+    иначе получите модули, привязанные к чужой (например, дефолтной сессионной)
+    БД из кэша sys.modules.
+
+    Для тестов, которые проверяют сами миграции (в т.ч. миграцию уже
+    существующей БД), используйте `db_env` — она не создаёт таблицы заранее.
+    """
+    db_path = tmp_path / "test.db"
+    cfg_path = _write_test_config(tmp_path, db_path)
     monkeypatch.setenv("PRINTAUDIT_CONFIG", str(cfg_path))
     _reset_app_modules()
 
@@ -112,5 +122,22 @@ default_price_per_page_color: 40
 
     database.Base.metadata.create_all(database.engine)
     yield database
+    database.engine.dispose()
+    _reset_app_modules()
+
+
+@pytest.fixture
+def db_env(tmp_path, monkeypatch):
+    """Как `app_env`, но БД остаётся полностью пустой (ни одной таблицы) —
+    для тестов, которые сами прогоняют Alembic (или сами создают "легаси"
+    схему руками перед тем, как прогнать миграции на неё)."""
+    db_path = tmp_path / "test.db"
+    cfg_path = _write_test_config(tmp_path, db_path)
+    monkeypatch.setenv("PRINTAUDIT_CONFIG", str(cfg_path))
+    _reset_app_modules()
+
+    import printaudit.database as database
+
+    yield database, db_path
     database.engine.dispose()
     _reset_app_modules()
