@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="subnav">
+  <a href="/admin">Обзор</a>
+  {% if current_user.role == "superadmin" %}<a href="/admin/administrators">Администраторы</a>{% endif %}
+  <a href="/admin/departments">Отделы</a>
+  <a href="/admin/ad-users">Пользователи AD</a>
+  <a href="/admin/ad-groups">Группы AD</a>
+  <a href="/admin/department-rules">Правила отделов (dry-run)</a>
+  <a href="/admin/printers">Принтеры</a>
+  <a href="/admin/pricing">Тарифы</a>
+</div>
+{% block admin_content %}{% endblock %}
+{% endblock %}

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Выгружает новые события печати (по умолчанию Event ID 307,
   "Job completed") из журнала Microsoft-Windows-PrintService/Operational
@@ -37,6 +37,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# См. calibrate_event_fields.ps1 — тот же фикс кодировки для Windows PowerShell 5.1
+# (кириллица в сообщениях об ошибках и BOM у самого файла).
+if ($PSVersionTable.PSVersion.Major -le 5) {
+    try { & chcp.com 65001 > $null } catch {}
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+}
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 try {
@@ -70,4 +77,20 @@ $result = @(
     }
 )
 
-$result | ConvertTo-Json -Depth 4 -Compress
+# ВАЖНО: результат ВСЕГДА должен быть JSON-массивом, даже если найдено ровно
+# одно событие. ConvertTo-Json разворачивает переданный через pipe ($result |
+# ConvertTo-Json) массив из одного элемента и отдаёт JSON-объект вместо
+# массива, если PowerShell что видит на входе всего один объект — а это ровно
+# так и происходит, когда события ровно одно.
+# Исправление: передаём массив через -InputObject, а не через pipe — так
+# ConvertTo-Json видит коллекцию как есть и не разворачивает её.
+$json = ConvertTo-Json -InputObject $result -Depth 4 -Compress
+
+# Дополнительная защита (belt-and-suspenders): если по любой причине на выходе
+# всё же не массив (например, из-за будущих правок ConvertTo-Json/PowerShell),
+# оборачиваем вручную, а не полагаемся только на -InputObject.
+if ($json -notmatch '^\s*\[') {
+    $json = "[$json]"
+}
+
+Write-Output $json

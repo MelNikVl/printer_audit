@@ -1,0 +1,791 @@
+"""Раздел /admin — обзор, администраторы, отделы, AD-пользователи/группы и
+правила, принтеры, тарифы. Каждый роут явно требует роль через
+require_role(...) на уровне зависимости — это работает независимо от того,
+показан ли пункт меню (webapp/templates/base.html прячет "Администрирование"
+для viewer, но сам роут защищён отдельно и не полагается на скрытие ссылки)."""
+from datetime import datetime
+from typing import Literal, Optional
+from urllib.parse import urlencode
+
+from fastapi import APIRouter, Depends, Form, Request
+from fastapi.responses import RedirectResponse
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from printaudit import roles
+from printaudit.ad.client import ADClient, ADError
+from printaudit.ad_normalize import normalize_login
+from printaudit.ad_settings import get_ad_settings
+from printaudit.admin_users import AdminActionError, delete_admin_assignment, disable_admin, upsert_admin_assignment
+from printaudit.audit import record as audit_record
+from printaudit.config import get_settings
+from printaudit.department_resolver import apply_ad_department_sync, plan_ad_department_sync
+from printaudit.models import (
+    AdDepartmentRule,
+    AdGroup,
+    AdGroupMembership,
+    AdUser,
+    AppUser,
+    CollectorState,
+    Department,
+    PriceRule,
+    PrinterQueue,
+    PrintJob,
+    SyncRun,
+)
+from printaudit.models import User as LegacyUser
+from printaudit.printers.discovery import PrinterDiscoveryError, sync_printer_queues
+from printaudit.printers.resolver import resolve_price
+from printaudit.timeutil import utcnow
+from webapp.deps import csrf_token, get_ad_client, get_client_ip, get_db, require_csrf, require_role
+from webapp.templating import templates
+
+router = APIRouter(prefix="/admin")
+
+ADMIN_ROLES = (roles.ADMIN, roles.SUPERADMIN)
+
+
+def _redirect(path: str, **params) -> RedirectResponse:
+    params = {k: v for k, v in params.items() if v}
+    query = f"?{urlencode(params)}" if params else ""
+    return RedirectResponse(url=f"{path}{query}", status_code=303)
+
+
+def _parse_date_or_none(value: str) -> Optional[datetime]:
+    return datetime.strptime(value, "%Y-%m-%d") if value else None
+
+
+# ---------------------------------------------------------------------------
+# Обзор
+# ---------------------------------------------------------------------------
+
+
+@router.get("")
+def admin_overview(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    ad_settings = get_ad_settings()
+    last_ad_sync = db.query(SyncRun).filter_by(run_type="ad_sync").order_by(SyncRun.started_at.desc()).first()
+    last_printer_sync = (
+        db.query(SyncRun).filter_by(run_type="printer_discovery").order_by(SyncRun.started_at.desc()).first()
+    )
+    last_collector_run = (
+        db.query(SyncRun).filter_by(run_type="collector").order_by(SyncRun.started_at.desc()).first()
+    )
+    recent_failed_runs = (
+        db.query(SyncRun).filter_by(status="failed").order_by(SyncRun.started_at.desc()).limit(5).all()
+    )
+    collector_states = db.query(CollectorState).all()
+
+    return templates.TemplateResponse(
+        "admin/overview.html",
+        {
+            "request": request,
+            "current_user": current_user,
+            "csrf_token": csrf_token(request),
+            "ad_configured": ad_settings.is_configured,
+            "ad_server": ad_settings.server,
+            "ad_bind_configured": bool(ad_settings.bind_user),
+            "last_ad_sync": last_ad_sync,
+            "ad_user_count": db.query(AdUser).count(),
+            "ad_group_count": db.query(AdGroup).count(),
+            "department_count": db.query(Department).filter_by(is_active=True).count(),
+            "printer_queue_count": db.query(PrinterQueue).filter_by(is_active=True).count(),
+            "printer_queue_missing_count": db.query(PrinterQueue).filter_by(is_active=False).count(),
+            "last_printer_sync": last_printer_sync,
+            "last_collector_run": last_collector_run,
+            "collector_states": collector_states,
+            "recent_failed_runs": recent_failed_runs,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Администраторы (только superadmin)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/administrators")
+def admin_administrators(
+    request: Request,
+    q: str = "",
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_role(roles.SUPERADMIN)),
+    ad_client: ADClient = Depends(get_ad_client),
+):
+    admins = db.query(AppUser).order_by(AppUser.role.desc(), AppUser.login_normalized).all()
+    ad_results, ad_search_error = [], None
+    if q.strip():
+        try:
+            ad_results = ad_client.search_users(q.strip())
+        except ADError as exc:
+            ad_search_error = str(exc)
+    return templates.TemplateResponse(
+        "admin/administrators.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "admins": admins, "q": q, "ad_results": ad_results, "ad_search_error": ad_search_error,
+            "all_roles": roles.ALL_ROLES,
+        },
+    )
+
+
+@router.post("/administrators/assign", dependencies=[Depends(require_csrf)])
+def admin_administrators_assign(
+    request: Request,
+    login: str = Form(...),
+    role: Literal["viewer", "admin", "superadmin"] = Form(...),
+    display_name: str = Form(""),
+    email: str = Form(""),
+    ad_sid: str = Form(""),
+    ad_object_guid: str = Form(""),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_role(roles.SUPERADMIN)),
+):
+    login_normalized = normalize_login(login)
+    try:
+        upsert_admin_assignment(
+            db, actor=current_user, login_normalized=login_normalized, role=role,
+            ad_sid=ad_sid or None, ad_object_guid=ad_object_guid or None,
+            display_name=display_name or None, email=email or None,
+            ip_address=get_client_ip(request),
+        )
+    except AdminActionError as exc:
+        db.rollback()
+        return _redirect("/admin/administrators", err=str(exc))
+    db.commit()
+    return _redirect("/admin/administrators", msg=f"Назначение для {login_normalized} сохранено")
+
+
+@router.post("/administrators/{app_user_id}/disable", dependencies=[Depends(require_csrf)])
+def admin_administrators_disable(
+    app_user_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(roles.SUPERADMIN)),
+):
+    target = db.get(AppUser, app_user_id)
+    if target is None:
+        return _redirect("/admin/administrators", err="Пользователь не найден")
+    try:
+        disable_admin(db, actor=current_user, target=target, ip_address=get_client_ip(request))
+    except AdminActionError as exc:
+        db.rollback()
+        return _redirect("/admin/administrators", err=str(exc))
+    db.commit()
+    return _redirect("/admin/administrators", msg=f"Доступ для {target.login_normalized} отключён")
+
+
+@router.post("/administrators/{app_user_id}/delete", dependencies=[Depends(require_csrf)])
+def admin_administrators_delete(
+    app_user_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(roles.SUPERADMIN)),
+):
+    target = db.get(AppUser, app_user_id)
+    if target is None:
+        return _redirect("/admin/administrators", err="Пользователь не найден")
+    try:
+        delete_admin_assignment(db, actor=current_user, target=target, ip_address=get_client_ip(request))
+    except AdminActionError as exc:
+        db.rollback()
+        return _redirect("/admin/administrators", err=str(exc))
+    db.commit()
+    return _redirect("/admin/administrators", msg="Назначение удалено")
+
+
+# ---------------------------------------------------------------------------
+# Отделы
+# ---------------------------------------------------------------------------
+
+
+@router.get("/departments")
+def admin_departments(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    departments = db.query(Department).order_by(Department.display_order, Department.name).all()
+    return templates.TemplateResponse(
+        "admin/departments.html",
+        {"request": request, "current_user": current_user, "csrf_token": csrf_token(request), "departments": departments},
+    )
+
+
+@router.post("/departments/create", dependencies=[Depends(require_csrf)])
+def admin_departments_create(
+    request: Request,
+    name: str = Form(...), cost_center_code: str = Form(""), description: str = Form(""), display_order: int = Form(0),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    name = name.strip()
+    if not name:
+        return _redirect("/admin/departments", err="Название отдела обязательно")
+    if db.query(Department).filter_by(name=name).first():
+        return _redirect("/admin/departments", err=f"Отдел «{name}» уже существует")
+    dept = Department(
+        name=name, cost_center_code=cost_center_code or None, description=description or None,
+        display_order=display_order, is_active=True,
+    )
+    db.add(dept)
+    db.flush()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="department.create", object_type="department",
+        object_id=dept.id, new_value={"name": name}, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/departments", msg=f"Отдел «{name}» создан")
+
+
+@router.post("/departments/{department_id}/update", dependencies=[Depends(require_csrf)])
+def admin_departments_update(
+    department_id: int, request: Request,
+    name: str = Form(...), cost_center_code: str = Form(""), description: str = Form(""),
+    display_order: int = Form(0), is_active: Optional[str] = Form(None),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    # HTML-чекбокс НЕ отправляется вовсе, если он снят -- поэтому здесь строка
+    # ("true" | None), а не bool с дефолтом True (иначе снятие галочки в форме
+    # никогда не привело бы к archив/is_active=False).
+    dept = db.get(Department, department_id)
+    if dept is None:
+        return _redirect("/admin/departments", err="Отдел не найден")
+    old = {"name": dept.name, "is_active": dept.is_active}
+    dept.name = name.strip() or dept.name
+    dept.cost_center_code = cost_center_code or None
+    dept.description = description or None
+    dept.display_order = display_order
+    dept.is_active = is_active == "true"
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="department.update", object_type="department",
+        object_id=dept.id, old_value=old, new_value={"name": dept.name, "is_active": dept.is_active},
+        ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/departments", msg="Отдел обновлён")
+
+
+@router.post("/departments/{department_id}/delete", dependencies=[Depends(require_csrf)])
+def admin_departments_delete(
+    department_id: int, request: Request,
+    reassign_to: Optional[int] = Form(None),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    dept = db.get(Department, department_id)
+    if dept is None:
+        return _redirect("/admin/departments", err="Отдел не найден")
+
+    refs = (
+        db.query(LegacyUser).filter_by(department_id=department_id).count()
+        + db.query(AdUser).filter_by(department_id=department_id).count()
+        + db.query(PrintJob).filter_by(department_id=department_id).count()
+    )
+    if refs and not reassign_to:
+        return _redirect(
+            "/admin/departments",
+            err=(
+                f"У отдела «{dept.name}» есть привязанные пользователи/задания ({refs}). "
+                f"Укажите отдел для переназначения при удалении, либо снимите галку «Активен» "
+                f"вместо удаления (архивирование)."
+            ),
+        )
+    if refs and reassign_to:
+        target = db.get(Department, reassign_to)
+        if target is None:
+            return _redirect("/admin/departments", err="Отдел для переназначения не найден")
+        db.query(LegacyUser).filter_by(department_id=department_id).update({"department_id": reassign_to})
+        db.query(AdUser).filter_by(department_id=department_id).update({"department_id": reassign_to})
+        db.query(PrintJob).filter_by(department_id=department_id).update({"department_id": reassign_to})
+
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="department.delete", object_type="department",
+        object_id=dept.id, old_value={"name": dept.name}, ip_address=get_client_ip(request),
+    )
+    db.delete(dept)
+    db.commit()
+    suffix = " (пользователи и задания переназначены)" if refs else ""
+    return _redirect("/admin/departments", msg=f"Отдел удалён{suffix}")
+
+
+# ---------------------------------------------------------------------------
+# Пользователи AD
+# ---------------------------------------------------------------------------
+
+
+@router.get("/ad-users")
+def admin_ad_users(
+    request: Request, q: str = "",
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+    ad_client: ADClient = Depends(get_ad_client),
+):
+    imported = db.query(AdUser).order_by(AdUser.login_normalized).all()
+    departments = db.query(Department).filter_by(is_active=True).order_by(Department.name).all()
+    ad_results, ad_search_error = [], None
+    if q.strip():
+        try:
+            ad_results = ad_client.search_users(q.strip())
+        except ADError as exc:
+            ad_search_error = str(exc)
+    imported_logins = {u.login_normalized for u in imported}
+    return templates.TemplateResponse(
+        "admin/ad_users.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "imported": imported, "departments": departments, "q": q,
+            "ad_results": ad_results, "ad_search_error": ad_search_error, "imported_logins": imported_logins,
+        },
+    )
+
+
+@router.post("/ad-users/import", dependencies=[Depends(require_csrf)])
+def admin_ad_users_import(
+    request: Request,
+    sam_account_name: str = Form(...), login: str = Form(...), domain: str = Form(""),
+    display_name: str = Form(""), email: str = Form(""), sid: str = Form(""), object_guid: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    login_normalized = normalize_login(login)
+    existing = db.query(AdUser).filter_by(login_normalized=login_normalized).first()
+    if existing is None:
+        existing = AdUser(login_normalized=login_normalized, sam_account_name=sam_account_name)
+        db.add(existing)
+    existing.sid = sid or existing.sid
+    existing.object_guid = object_guid or existing.object_guid
+    existing.domain = domain or existing.domain
+    existing.display_name = display_name or existing.display_name
+    existing.email = email or existing.email
+    existing.last_synced_at = utcnow()
+    db.flush()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="ad_user.import", object_type="ad_user",
+        object_id=existing.id, new_value={"login": login_normalized}, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/ad-users", msg=f"Пользователь {login_normalized} импортирован")
+
+
+@router.post("/ad-users/{ad_user_id}/department", dependencies=[Depends(require_csrf)])
+def admin_ad_users_department(
+    ad_user_id: int, request: Request,
+    department_id: Optional[int] = Form(None), locked: bool = Form(False),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    ad_user = db.get(AdUser, ad_user_id)
+    if ad_user is None:
+        return _redirect("/admin/ad-users", err="Пользователь не найден")
+    old = {"department_id": ad_user.department_id, "department_locked": ad_user.department_locked}
+    ad_user.department_id = department_id
+    ad_user.department_source = "manual"
+    ad_user.department_locked = locked
+    ad_user.department_rule_id = None
+    ad_user.updated_at = utcnow()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="ad_user.set_department", object_type="ad_user",
+        object_id=ad_user.id, old_value=old, new_value={"department_id": department_id, "locked": locked},
+        ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/ad-users", msg="Отдел сохранён")
+
+
+@router.post("/ad-users/{ad_user_id}/disable", dependencies=[Depends(require_csrf)])
+def admin_ad_users_disable(
+    ad_user_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    ad_user = db.get(AdUser, ad_user_id)
+    if ad_user is None:
+        return _redirect("/admin/ad-users", err="Пользователь не найден")
+    ad_user.local_disabled = True
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="ad_user.disable", object_type="ad_user",
+        object_id=ad_user.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/ad-users", msg="Пользователь отключён локально")
+
+
+@router.post("/ad-users/{ad_user_id}/enable", dependencies=[Depends(require_csrf)])
+def admin_ad_users_enable(
+    ad_user_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    ad_user = db.get(AdUser, ad_user_id)
+    if ad_user is None:
+        return _redirect("/admin/ad-users", err="Пользователь не найден")
+    ad_user.local_disabled = False
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="ad_user.enable", object_type="ad_user",
+        object_id=ad_user.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/ad-users", msg="Пользователь включён")
+
+
+@router.post("/ad-users/resync", dependencies=[Depends(require_csrf)])
+def admin_ad_users_resync(
+    request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+    ad_client: ADClient = Depends(get_ad_client),
+):
+    started = utcnow()
+    updated, errors = 0, 0
+    for ad_user in db.query(AdUser).all():
+        try:
+            principal = ad_client.get_user_by_login(ad_user.login_normalized)
+        except ADError:
+            errors += 1
+            continue
+        if principal is None:
+            continue
+        ad_user.sid = principal.sid or ad_user.sid
+        ad_user.object_guid = principal.object_guid or ad_user.object_guid
+        ad_user.display_name = principal.display_name or ad_user.display_name
+        ad_user.email = principal.email or ad_user.email
+        ad_user.last_synced_at = utcnow()
+        updated += 1
+    db.add(
+        SyncRun(
+            run_type="ad_sync", started_at=started, finished_at=utcnow(),
+            status="success", inserted=updated, skipped=errors,
+        )
+    )
+    db.commit()
+    return _redirect("/admin/ad-users", msg=f"Синхронизация завершена: обновлено {updated}, ошибок {errors}")
+
+
+# ---------------------------------------------------------------------------
+# Группы AD и правила распределения по отделам
+# ---------------------------------------------------------------------------
+
+
+@router.get("/ad-groups")
+def admin_ad_groups(
+    request: Request, q: str = "",
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+    ad_client: ADClient = Depends(get_ad_client),
+):
+    groups = db.query(AdGroup).order_by(AdGroup.display_name).all()
+    rules_by_group = {r.ad_group_id: r for r in db.query(AdDepartmentRule).all()}
+    member_counts = dict(
+        db.query(AdGroupMembership.ad_group_id, func.count(AdGroupMembership.id))
+        .group_by(AdGroupMembership.ad_group_id)
+        .all()
+    )
+    departments = db.query(Department).filter_by(is_active=True).order_by(Department.name).all()
+    ad_results, ad_search_error = [], None
+    if q.strip():
+        try:
+            ad_results = ad_client.search_groups(q.strip())
+        except ADError as exc:
+            ad_search_error = str(exc)
+    imported_dns = {g.dn for g in groups}
+    return templates.TemplateResponse(
+        "admin/ad_groups.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "groups": groups, "rules_by_group": rules_by_group, "member_counts": member_counts,
+            "departments": departments, "q": q, "ad_results": ad_results, "ad_search_error": ad_search_error,
+            "imported_dns": imported_dns,
+        },
+    )
+
+
+@router.post("/ad-groups/import", dependencies=[Depends(require_csrf)])
+def admin_ad_groups_import(
+    request: Request,
+    dn: str = Form(...), sam_account_name: str = Form(""), display_name: str = Form(""), description: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    existing = db.query(AdGroup).filter_by(dn=dn).first()
+    if existing is None:
+        existing = AdGroup(
+            dn=dn, sam_account_name=sam_account_name, display_name=display_name or sam_account_name,
+            description=description or None,
+        )
+        db.add(existing)
+        db.flush()
+        audit_record(
+            db, actor_app_user_id=current_user.id, action="ad_group.import", object_type="ad_group",
+            object_id=existing.id, new_value={"dn": dn}, ip_address=get_client_ip(request),
+        )
+    existing.last_synced_at = utcnow()
+    db.commit()
+    return _redirect("/admin/ad-groups", msg=f"Группа {display_name or sam_account_name} импортирована")
+
+
+@router.post("/ad-groups/{group_id}/sync-members", dependencies=[Depends(require_csrf)])
+def admin_ad_groups_sync_members(
+    group_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+    ad_client: ADClient = Depends(get_ad_client),
+):
+    group = db.get(AdGroup, group_id)
+    if group is None:
+        return _redirect("/admin/ad-groups", err="Группа не найдена")
+    try:
+        members = ad_client.get_group_members(group.dn)
+    except ADError as exc:
+        return _redirect("/admin/ad-groups", err=f"Не удалось получить членов группы: {exc}")
+
+    current_ids = set()
+    for principal in members:
+        ad_user = db.query(AdUser).filter_by(login_normalized=principal.login_normalized).first()
+        if ad_user is None:
+            ad_user = AdUser(
+                sam_account_name=principal.sam_account_name, login_normalized=principal.login_normalized,
+                domain=principal.domain, display_name=principal.display_name, email=principal.email,
+                sid=principal.sid, object_guid=principal.object_guid, last_synced_at=utcnow(),
+            )
+            db.add(ad_user)
+            db.flush()
+        membership = (
+            db.query(AdGroupMembership).filter_by(ad_group_id=group.id, ad_user_id=ad_user.id).first()
+        )
+        if membership is None:
+            db.add(AdGroupMembership(ad_group_id=group.id, ad_user_id=ad_user.id))
+        current_ids.add(ad_user.id)
+
+    stale = (
+        db.query(AdGroupMembership)
+        .filter_by(ad_group_id=group.id)
+        .filter(~AdGroupMembership.ad_user_id.in_(current_ids))
+        .all()
+    )
+    for membership in stale:
+        db.delete(membership)
+
+    group.last_synced_at = utcnow()
+    db.add(SyncRun(run_type="ad_sync", started_at=utcnow(), finished_at=utcnow(), status="success", inserted=len(members)))
+    db.commit()
+    return _redirect("/admin/ad-groups", msg=f"Синхронизировано участников группы: {len(members)}")
+
+
+@router.post("/ad-groups/{group_id}/rule", dependencies=[Depends(require_csrf)])
+def admin_ad_groups_set_rule(
+    group_id: int, request: Request,
+    department_id: int = Form(...), priority: int = Form(0), is_active: Optional[str] = Form(None),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    # См. комментарий в /admin/departments/{id}/update про чекбоксы и Form(bool).
+    is_active_bool = is_active == "true"
+    group = db.get(AdGroup, group_id)
+    if group is None:
+        return _redirect("/admin/ad-groups", err="Группа не найдена")
+    rule = db.query(AdDepartmentRule).filter_by(ad_group_id=group_id).first()
+    old = None
+    if rule is None:
+        rule = AdDepartmentRule(
+            ad_group_id=group_id, department_id=department_id, priority=priority,
+            is_active=is_active_bool, created_by_id=current_user.id,
+        )
+        db.add(rule)
+    else:
+        old = {"department_id": rule.department_id, "priority": rule.priority, "is_active": rule.is_active}
+        rule.department_id = department_id
+        rule.priority = priority
+        rule.is_active = is_active_bool
+        rule.updated_at = utcnow()
+    db.flush()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="ad_department_rule.set", object_type="ad_department_rule",
+        object_id=rule.id, old_value=old,
+        new_value={"department_id": department_id, "priority": priority, "is_active": is_active_bool},
+        ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/ad-groups", msg="Правило сохранено")
+
+
+@router.get("/department-rules")
+def admin_department_rules_dry_run(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    changes = plan_ad_department_sync(db)
+    departments = {d.id: d.name for d in db.query(Department).all()}
+    return templates.TemplateResponse(
+        "admin/department_rules.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "changes": changes, "departments": departments,
+        },
+    )
+
+
+@router.post("/department-rules/apply", dependencies=[Depends(require_csrf)])
+def admin_department_rules_apply(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    changes = apply_ad_department_sync(db)
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="ad_department_rules.apply",
+        object_type="ad_department_rule", new_value={"changed_users": len(changes)},
+        ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/department-rules", msg=f"Применено изменений: {len(changes)}")
+
+
+# ---------------------------------------------------------------------------
+# Принтеры и очереди
+# ---------------------------------------------------------------------------
+
+
+@router.get("/printers")
+def admin_printers(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    queues = db.query(PrinterQueue).order_by(PrinterQueue.is_active.desc(), PrinterQueue.printer_name).all()
+    return templates.TemplateResponse(
+        "admin/printers.html",
+        {"request": request, "current_user": current_user, "csrf_token": csrf_token(request), "queues": queues},
+    )
+
+
+@router.post("/printers/discover", dependencies=[Depends(require_csrf)])
+def admin_printers_discover(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    started = utcnow()
+    try:
+        summary = sync_printer_queues(db)
+    except PrinterDiscoveryError as exc:
+        db.rollback()
+        db.add(
+            SyncRun(
+                run_type="printer_discovery", started_at=started, finished_at=utcnow(),
+                status="failed", error_message=str(exc)[:2000],
+            )
+        )
+        db.commit()
+        return _redirect("/admin/printers", err=f"Обнаружение очередей не удалось: {exc}")
+
+    db.add(
+        SyncRun(
+            run_type="printer_discovery", started_at=started, finished_at=utcnow(), status="success",
+            inserted=summary.created, events_fetched=summary.seen, skipped=summary.newly_missing,
+        )
+    )
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="printer_queue.discover", object_type="printer_queue",
+        new_value={"created": summary.created, "missing": summary.newly_missing, "seen": summary.seen},
+        ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect(
+        "/admin/printers",
+        msg=f"Найдено очередей: {summary.seen}, новых: {summary.created}, пропало: {summary.newly_missing}",
+    )
+
+
+@router.post("/printers/{queue_id}/update", dependencies=[Depends(require_csrf)])
+def admin_printers_update(
+    queue_id: int, request: Request,
+    display_name: str = Form(""), color_mode: Literal["unknown", "bw", "color"] = Form("unknown"),
+    collection_enabled: Optional[str] = Form(None), price_per_page: Optional[float] = Form(None), currency: str = Form("KZT"),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    # Как и в /admin/departments: чекбокс не отправляется вовсе, когда снят,
+    # поэтому bool с дефолтом True сделал бы отключение учёта через форму
+    # невозможным -- принимаем строку и сравниваем явно.
+    queue = db.get(PrinterQueue, queue_id)
+    if queue is None:
+        return _redirect("/admin/printers", err="Очередь не найдена")
+    old = {
+        "display_name": queue.display_name, "color_mode": queue.color_mode,
+        "collection_enabled": queue.collection_enabled, "price_per_page": queue.price_per_page,
+    }
+    queue.display_name = display_name.strip() or queue.printer_name
+    queue.color_mode = color_mode
+    queue.collection_enabled = collection_enabled == "true"
+    queue.price_per_page = price_per_page
+    queue.currency = currency or queue.currency
+    queue.updated_at = utcnow()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="printer_queue.update", object_type="printer_queue",
+        object_id=queue.id, old_value=old,
+        new_value={
+            "display_name": queue.display_name, "color_mode": color_mode,
+            "collection_enabled": queue.collection_enabled, "price_per_page": price_per_page,
+        },
+        ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/printers", msg=f"Очередь «{queue.printer_name}» обновлена")
+
+
+# ---------------------------------------------------------------------------
+# Тарифы
+# ---------------------------------------------------------------------------
+
+
+@router.get("/pricing")
+def admin_pricing(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    rules = db.query(PriceRule).order_by(PriceRule.priority.desc(), PriceRule.id.desc()).all()
+    queues = db.query(PrinterQueue).order_by(PrinterQueue.printer_name).all()
+    return templates.TemplateResponse(
+        "admin/pricing.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "rules": rules, "queues": queues,
+        },
+    )
+
+
+@router.post("/pricing/create", dependencies=[Depends(require_csrf)])
+def admin_pricing_create(
+    request: Request,
+    printer_queue_id: Optional[int] = Form(None), is_color: bool = Form(False),
+    price_per_page: float = Form(...), currency: str = Form("KZT"),
+    valid_from: str = Form(""), valid_to: str = Form(""), priority: int = Form(0),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    if price_per_page < 0:
+        return _redirect("/admin/pricing", err="Цена за страницу не может быть отрицательной")
+    rule = PriceRule(
+        printer_queue_id=printer_queue_id or None, is_color=is_color, price_per_page=price_per_page,
+        currency=currency or "KZT", valid_from=_parse_date_or_none(valid_from), valid_to=_parse_date_or_none(valid_to),
+        priority=priority, is_active=True, created_by_id=current_user.id,
+    )
+    db.add(rule)
+    db.flush()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="price_rule.create", object_type="price_rule",
+        object_id=rule.id, new_value={"price_per_page": price_per_page, "printer_queue_id": printer_queue_id},
+        ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/pricing", msg="Тариф создан")
+
+
+@router.post("/pricing/{rule_id}/deactivate", dependencies=[Depends(require_csrf)])
+def admin_pricing_deactivate(
+    rule_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    rule = db.get(PriceRule, rule_id)
+    if rule is None:
+        return _redirect("/admin/pricing", err="Тариф не найден")
+    rule.is_active = False
+    rule.updated_at = utcnow()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="price_rule.deactivate", object_type="price_rule",
+        object_id=rule.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/pricing", msg="Тариф отключён")
+
+
+@router.get("/pricing/test")
+def admin_pricing_test(
+    printer_queue_id: int, pages: int = 1, at: str = "",
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    queue = db.get(PrinterQueue, printer_queue_id)
+    if queue is None:
+        return {"error": "Очередь не найдена"}
+    at_dt = _parse_date_or_none(at) or utcnow()
+    price, is_color, currency, rule_id = resolve_price(db, queue, at_dt, get_settings())
+    return {
+        "printer_queue": queue.printer_name, "price_per_page": price, "is_color": is_color,
+        "currency": currency, "price_rule_id": rule_id, "pages": pages, "total_cost": round(price * pages, 2),
+    }

@@ -1,0 +1,52 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Принтеры и очереди</h1>
+
+<form method="post" action="/admin/printers/discover">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">Обнаружить / синхронизировать очереди (Get-Printer)</button>
+</form>
+
+<table>
+  <tr>
+    <th>Очередь</th><th>Отображаемое имя</th><th>Сервер</th><th>Статус Windows</th>
+    <th>Цвет</th><th>Учёт</th><th>Цена/стр.</th><th>Валюта</th><th>Присутствует</th><th></th>
+  </tr>
+  {% for q in queues %}
+  <tr>
+    <td>{{ q.printer_name }}</td>
+    <td><input type="text" name="display_name" form="pq-form-{{ q.id }}" value="{{ q.display_name or '' }}"></td>
+    <td>{{ q.server_name or "" }}</td>
+    <td>{{ q.printer_status or "" }}</td>
+    <td>
+      <select name="color_mode" form="pq-form-{{ q.id }}">
+        <option value="unknown" {% if q.color_mode == "unknown" %}selected{% endif %}>неизвестно</option>
+        <option value="bw" {% if q.color_mode == "bw" %}selected{% endif %}>Ч/Б</option>
+        <option value="color" {% if q.color_mode == "color" %}selected{% endif %}>цветной</option>
+      </select>
+    </td>
+    <td><label><input type="checkbox" name="collection_enabled" form="pq-form-{{ q.id }}" value="true" {% if q.collection_enabled %}checked{% endif %}></label></td>
+    <td><input type="number" step="0.01" name="price_per_page" form="pq-form-{{ q.id }}" value="{{ q.price_per_page if q.price_per_page is not none else '' }}" style="width:70px"></td>
+    <td><input type="text" name="currency" form="pq-form-{{ q.id }}" value="{{ q.currency }}" style="width:50px"></td>
+    <td>
+      {% if q.is_active %}<span class="badge badge-active">да</span>
+      {% else %}<span class="badge badge-missing">пропала</span>{% endif %}
+    </td>
+    <td><button type="submit" form="pq-form-{{ q.id }}">Сохранить</button></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="10" class="empty-state">Очередей пока нет — нажмите «Обнаружить очереди»</td></tr>
+  {% endfor %}
+</table>
+
+{% for q in queues %}
+<form id="pq-form-{{ q.id }}" method="post" action="/admin/printers/{{ q.id }}/update">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+</form>
+{% endfor %}
+
+<p style="color:#6b7280; font-size:13px">
+  Исчезнувшая из Get-Printer очередь помечается «пропала», но её строка и вся история печати сохраняются —
+  ничего не удаляется автоматически.
+</p>
+{% endblock %}

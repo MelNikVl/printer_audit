@@ -1,12 +1,17 @@
--- Справочная схема БД print_audit (диалект PostgreSQL для наглядности типов).
--- В реальном развёртывании таблицы создаются автоматически из
--- printaudit/models.py командой `python scripts\init_db.py` — этот файл
--- служит документацией и вариантом для ручного создания БД PostgreSQL,
--- если её настраивают отдельно от приложения.
+-- Справочная схема ИСХОДНЫХ 5 таблиц MVP (диалект PostgreSQL для наглядности
+-- типов): departments, users, price_list, print_jobs, collector_state.
 --
--- Для SQLite синтаксис немного отличается (нет SERIAL/BOOLEAN как отдельных
--- типов, TIMESTAMPTZ -> TEXT/DATETIME) — но результат идентичен тому, что
--- создаёт SQLAlchemy, поэтому руками эту схему для SQLite создавать не нужно.
+-- Полная актуальная схема (app_users, ad_users, ad_groups, printer_queues,
+-- price_rules, audit_log, sync_runs, web_sessions и расширения этих 5
+-- таблиц) версионируется через Alembic — см. alembic/versions/*.py,
+-- по одной ревизии на каждый этап; там же официальный источник правды для
+-- типов колонок и constraint'ов. Этот файл оставлен как более читаемый
+-- быстрый обзор ИСТОРИЧЕСКОЙ части схемы, не путать с полной.
+--
+-- В реальном развёртывании таблицы создаются/обновляются автоматически
+-- командой `python scripts\init_db.py` (= `alembic upgrade head` + сидинг
+-- price_list) — руками эту схему создавать не нужно ни для SQLite, ни для
+-- PostgreSQL.
 
 CREATE TABLE departments (
     id                 SERIAL PRIMARY KEY,

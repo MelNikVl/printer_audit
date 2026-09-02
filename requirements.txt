@@ -5,6 +5,9 @@ sqlalchemy==2.0.35
 pydantic==2.9.2
 PyYAML==6.0.2
 python-multipart==0.0.9
+alembic==1.13.3
+ldap3==2.9.1
+python-dotenv==1.0.1
 
 # Опционально, только если БД = PostgreSQL (см. config/config.yaml -> db.url)
 # psycopg2-binary==2.9.9

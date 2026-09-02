@@ -1,0 +1,93 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Администраторы</h1>
+<p>Кто может входить в систему и с какой ролью. Только superadmin видит эту страницу.</p>
+
+<h2>Текущие назначения</h2>
+<table>
+  <tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Статус</th><th>Назначил</th><th>Когда</th><th></th></tr>
+  {% for a in admins %}
+  <tr>
+    <td>{{ a.login_normalized }}</td>
+    <td>{{ a.display_name or "" }}</td>
+    <td><span class="badge badge-{{ a.role }}">{{ a.role }}</span></td>
+    <td>
+      {% if a.is_active %}<span class="badge badge-active">активен</span>
+      {% else %}<span class="badge badge-inactive">отключён</span>{% endif %}
+    </td>
+    <td>{{ a.assigned_by_id or "" }}</td>
+    <td>{{ a.assigned_at }}</td>
+    <td>
+      {% if a.id != current_user.id %}
+      {% if a.is_active %}
+      <form class="inline-form" method="post" action="/admin/administrators/{{ a.id }}/disable">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" onclick="return confirm('Отключить доступ для {{ a.login_normalized }}?')">Отключить</button>
+      </form>
+      {% endif %}
+      <form class="inline-form" method="post" action="/admin/administrators/{{ a.id }}/delete">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-danger" onclick="return confirm('Удалить назначение {{ a.login_normalized }}? Это действие необратимо.')">Удалить</button>
+      </form>
+      {% else %}
+      <span class="nav-user">(вы)</span>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7" class="empty-state">Пока нет ни одного администратора кроме вас</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Назначить роль по логину напрямую</h2>
+<form class="filters" method="post" action="/admin/administrators/assign">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div><label>Логин (DOMAIN\login)</label><input type="text" name="login" required></div>
+  <div><label>Роль</label>
+    <select name="role">
+      {% for r in all_roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+    </select>
+  </div>
+  <button type="submit">Назначить</button>
+</form>
+
+<h2>Найти пользователя в AD</h2>
+<form class="filters" method="get" action="/admin/administrators">
+  <div><label>Поиск (логин, имя, email)</label><input type="text" name="q" value="{{ q }}"></div>
+  <button type="submit">Искать в AD</button>
+</form>
+
+{% if ad_search_error %}
+<div class="flash flash-err">{{ ad_search_error }}</div>
+{% endif %}
+
+{% if ad_results %}
+<table>
+  <tr><th>Логин</th><th>Имя</th><th>Email</th><th>Роль для назначения</th><th></th></tr>
+  {% for u in ad_results %}
+  <tr>
+    <td>{{ u.sam_account_name }}</td>
+    <td>{{ u.display_name or "" }}</td>
+    <td>{{ u.email or "" }}</td>
+    <td>
+      <form class="inline-form" method="post" action="/admin/administrators/assign">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="login" value="{{ u.login_normalized }}">
+        <input type="hidden" name="display_name" value="{{ u.display_name or '' }}">
+        <input type="hidden" name="email" value="{{ u.email or '' }}">
+        <input type="hidden" name="ad_sid" value="{{ u.sid or '' }}">
+        <input type="hidden" name="ad_object_guid" value="{{ u.object_guid or '' }}">
+        <select name="role">
+          {% for r in all_roles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+        </select>
+        <button type="submit">Добавить</button>
+      </form>
+    </td>
+    <td></td>
+  </tr>
+  {% endfor %}
+</table>
+{% elif q %}
+<div class="empty-state">В AD ничего не найдено по запросу «{{ q }}»</div>
+{% endif %}
+{% endblock %}

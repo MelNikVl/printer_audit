@@ -1,0 +1,27 @@
+# Виртуальное окружение и артефакты сборки Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Данные и логи (генерируются локально на каждом объекте)
+/data/
+/logs/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+
+# Секреты и конфигурация конкретного объекта — НИКОГДА не коммитить.
+# Держите в репозитории только *.example.* варианты этих файлов.
+.env
+.env.*
+!.env.example
+config/config.yaml
+config/users_departments.csv
+config/*.local.yaml
+
+# Резервные копии/дампы БД, которые иногда кладут рядом с проектом при отладке.
+*.bak
+*.dump

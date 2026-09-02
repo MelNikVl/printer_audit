@@ -14,7 +14,24 @@
   <a href="/by-user">По пользователям</a>
   <a href="/by-printer">По принтерам</a>
   <a href="/export">Экспорт CSV</a>
+  {% if current_user and current_user.role in ("admin", "superadmin") %}
+  <a href="/admin">Администрирование</a>
+  {% endif %}
+  <span class="nav-spacer"></span>
+  {% if current_user %}
+  <span class="nav-user">{{ current_user.display_name or current_user.login_normalized }} ({{ current_user.role }})</span>
+  <form method="post" action="/logout" class="nav-logout-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Выйти</button>
+  </form>
+  {% endif %}
 </nav>
+{% if request.query_params.get("msg") %}
+<div class="flash flash-ok">{{ request.query_params.get("msg") }}</div>
+{% endif %}
+{% if request.query_params.get("err") %}
+<div class="flash flash-err">{{ request.query_params.get("err") }}</div>
+{% endif %}
 <main>
 {% block content %}{% endblock %}
 </main>

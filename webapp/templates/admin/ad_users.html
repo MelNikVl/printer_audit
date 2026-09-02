@@ -1,0 +1,96 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Пользователи AD</h1>
+
+<form class="filters" method="post" action="/admin/ad-users/resync" onsubmit="return confirm('Обновить данные всех импортированных пользователей из AD?')">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">Повторная синхронизация всех импортированных</button>
+</form>
+
+<table>
+  <tr><th>Логин</th><th>Имя</th><th>Email</th><th>SID/GUID</th><th>Отдел</th><th>Locked</th><th>Статус</th><th></th></tr>
+  {% for u in imported %}
+  <tr>
+    <td>{{ u.login_normalized }}</td>
+    <td>{{ u.display_name or "" }}</td>
+    <td>{{ u.email or "" }}</td>
+    <td style="font-size:11px">{{ u.sid or u.object_guid or "—" }}</td>
+    <td>
+      <form class="inline-form" method="post" action="/admin/ad-users/{{ u.id }}/department">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <select name="department_id" style="width:130px" {% if u.department_locked %}disabled{% endif %}>
+          <option value="">—</option>
+          {% for d in departments %}
+          <option value="{{ d.id }}" {% if d.id == u.department_id %}selected{% endif %}>{{ d.name }}</option>
+          {% endfor %}
+        </select>
+        <label><input type="checkbox" name="locked" value="true" {% if u.department_locked %}checked{% endif %}> lock</label>
+        <button type="submit">OK</button>
+      </form>
+    </td>
+    <td>{{ "да" if u.department_locked else "нет" }} ({{ u.department_source }})</td>
+    <td>
+      {% if u.local_disabled %}<span class="badge badge-inactive">отключён</span>
+      {% else %}<span class="badge badge-active">активен</span>{% endif %}
+    </td>
+    <td>
+      {% if u.local_disabled %}
+      <form class="inline-form" method="post" action="/admin/ad-users/{{ u.id }}/enable">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Включить</button>
+      </form>
+      {% else %}
+      <form class="inline-form" method="post" action="/admin/ad-users/{{ u.id }}/disable">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Отключить</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="8" class="empty-state">Пока не импортировано ни одного пользователя AD</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Найти и импортировать пользователя из AD</h2>
+<form class="filters" method="get" action="/admin/ad-users">
+  <div><label>Поиск (логин, имя, email)</label><input type="text" name="q" value="{{ q }}"></div>
+  <button type="submit">Искать</button>
+</form>
+
+{% if ad_search_error %}
+<div class="flash flash-err">{{ ad_search_error }}</div>
+{% endif %}
+
+{% if ad_results %}
+<table>
+  <tr><th>Логин</th><th>Имя</th><th>Email</th><th></th></tr>
+  {% for u in ad_results %}
+  <tr>
+    <td>{{ u.sam_account_name }}</td>
+    <td>{{ u.display_name or "" }}</td>
+    <td>{{ u.email or "" }}</td>
+    <td>
+      {% if u.login_normalized in imported_logins %}
+      <span class="badge badge-active">уже импортирован</span>
+      {% else %}
+      <form class="inline-form" method="post" action="/admin/ad-users/import">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="sam_account_name" value="{{ u.sam_account_name }}">
+        <input type="hidden" name="login" value="{{ u.login_normalized }}">
+        <input type="hidden" name="domain" value="{{ u.domain or '' }}">
+        <input type="hidden" name="display_name" value="{{ u.display_name or '' }}">
+        <input type="hidden" name="email" value="{{ u.email or '' }}">
+        <input type="hidden" name="sid" value="{{ u.sid or '' }}">
+        <input type="hidden" name="object_guid" value="{{ u.object_guid or '' }}">
+        <button type="submit">Импортировать</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% elif q %}
+<div class="empty-state">В AD ничего не найдено по запросу «{{ q }}»</div>
+{% endif %}
+{% endblock %}
