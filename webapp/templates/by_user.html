@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Отчёт по пользователям</h1>
+
+<form class="filters" method="get">
+  <div><label>С</label><input type="date" name="date_from" value="{{ date_from }}"></div>
+  <div><label>По</label><input type="date" name="date_to" value="{{ date_to }}"></div>
+  <button type="submit">Применить</button>
+</form>
+
+<div class="chart-wrap">
+  <canvas id="chart" height="90"></canvas>
+</div>
+
+<table>
+  <tr><th>Пользователь</th><th>Заданий</th><th>Страниц</th><th>Стоимость ({{ currency }})</th></tr>
+  {% for r in rows %}
+  <tr>
+    <td>{{ r.user_name }}</td>
+    <td>{{ r.jobs }}</td>
+    <td>{{ r.pages }}</td>
+    <td>{{ "%.2f"|format(r.cost) }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="4">Нет данных за выбранный период</td></tr>
+  {% endfor %}
+</table>
+
+<script>
+const labels = {{ rows[:20] | map(attribute="user_name") | list | tojson }};
+const costs = {{ rows[:20] | map(attribute="cost") | list | tojson }};
+new Chart(document.getElementById('chart'), {
+  type: 'bar',
+  data: { labels: labels, datasets: [{ label: 'Стоимость ({{ currency }}), топ-20', data: costs, backgroundColor: '#2563eb' }] },
+  options: { responsive: true, plugins: { legend: { display: false } } }
+});
+</script>
+{% endblock %}

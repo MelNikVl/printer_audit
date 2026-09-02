@@ -1,0 +1,4 @@
+user_name,department_name,cost_center_code
+DOMAIN\ivanov,Бухгалтерия,CC-100
+DOMAIN\petrova,Отдел продаж,CC-200
+DOMAIN\smirnov,IT,CC-010

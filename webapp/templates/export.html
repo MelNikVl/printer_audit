@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Экспорт в CSV</h1>
+<p>Выгружает все задания печати за период (с учётом фильтров) в CSV-файл.</p>
+
+<form class="filters" method="get" action="/export/csv">
+  <div><label>С</label><input type="date" name="date_from"></div>
+  <div><label>По</label><input type="date" name="date_to"></div>
+  <div><label>Пользователь (точное имя)</label><input type="text" name="user_name" placeholder="DOMAIN\\ivanov"></div>
+  <div><label>Принтер (точное имя)</label><input type="text" name="printer_name"></div>
+  <div><label>ID отдела</label><input type="number" name="department_id"></div>
+  <button type="submit">Скачать CSV</button>
+</form>
+{% endblock %}

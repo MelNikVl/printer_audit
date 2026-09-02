@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Print Audit{% if site_code %} — {{ site_code }}{% endif %}</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<nav>
+  <a href="/">Дашборд</a>
+  <a href="/by-department">По отделам</a>
+  <a href="/by-user">По пользователям</a>
+  <a href="/by-printer">По принтерам</a>
+  <a href="/export">Экспорт CSV</a>
+</nav>
+<main>
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

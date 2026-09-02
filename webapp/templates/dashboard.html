@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Дашборд печати{% if site_code %} — {{ site_code }}{% endif %}</h1>
+<h2>Текущий месяц ({{ month_label }})</h2>
+
+<div class="cards">
+  <div class="card"><div class="value">{{ totals.pages }}</div><div class="label">Страниц напечатано</div></div>
+  <div class="card"><div class="value">{{ "%.2f"|format(totals.cost) }} {{ currency }}</div><div class="label">Стоимость</div></div>
+  <div class="card"><div class="value">{{ totals.jobs }}</div><div class="label">Заданий печати</div></div>
+</div>
+
+<div class="two-col">
+  <div>
+    <h2>Топ-5 отделов по стоимости</h2>
+    <table>
+      <tr><th>Отдел</th><th>Страниц</th><th>Стоимость</th></tr>
+      {% for r in top_depts %}
+      <tr><td>{{ r.department }}</td><td>{{ r.pages }}</td><td>{{ "%.2f"|format(r.cost) }}</td></tr>
+      {% else %}
+      <tr><td colspan="3">Нет данных за этот месяц</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+  <div>
+    <h2>Топ-5 пользователей по стоимости</h2>
+    <table>
+      <tr><th>Пользователь</th><th>Страниц</th><th>Стоимость</th></tr>
+      {% for r in top_users %}
+      <tr><td>{{ r.user_name }}</td><td>{{ r.pages }}</td><td>{{ "%.2f"|format(r.cost) }}</td></tr>
+      {% else %}
+      <tr><td colspan="3">Нет данных за этот месяц</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+
+<div class="chart-wrap">
+  <canvas id="deptChart" height="90"></canvas>
+</div>
+
+<script>
+const deptLabels = {{ top_depts | map(attribute="department") | list | tojson }};
+const deptCosts = {{ top_depts | map(attribute="cost") | list | tojson }};
+new Chart(document.getElementById('deptChart'), {
+  type: 'bar',
+  data: { labels: deptLabels, datasets: [{ label: 'Стоимость ({{ currency }})', data: deptCosts, backgroundColor: '#2563eb' }] },
+  options: { responsive: true, plugins: { legend: { display: false } } }
+});
+</script>
+{% endblock %}
