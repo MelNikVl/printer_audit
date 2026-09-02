@@ -1,0 +1,91 @@
+"""Настройки Active Directory и веб-сессий — ТОЛЬКО из переменных окружения
+(опционально подхваченных из локального `.env`, который не коммитится).
+
+Сознательно не смешиваем это с config.yaml: config.yaml лежит в конфиге проекта
+и исторически мог считаться безопасным для показа коллеге по диагонали, тогда
+как здесь — учётные данные сервисного bind-аккаунта AD и секрет сессий. Даже
+факт "какой у нас AD_BASE_DN" мы не хотим держать в файле, который легко по
+ошибке закоммитить вместе с кодом.
+"""
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+
+    _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+    if _ENV_PATH.exists():
+        load_dotenv(_ENV_PATH, override=False)
+except ImportError:  # pragma: no cover - python-dotenv не установлен
+    pass
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    val = os.environ.get(name)
+    if not val:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+@dataclass
+class ADSettings:
+    server: str
+    port: int
+    use_ssl: bool
+    domain: str
+    base_dn: str
+    user_search_base: str
+    group_search_base: str
+    bind_user: Optional[str]
+    bind_password: Optional[str]
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.server and self.base_dn)
+
+
+@dataclass
+class SessionSettings:
+    secret_key: str
+    lifetime_minutes: int
+    cookie_secure: bool
+
+
+def get_ad_settings() -> ADSettings:
+    return ADSettings(
+        server=os.environ.get("AD_SERVER", ""),
+        port=_env_int("AD_PORT", 636),
+        use_ssl=_env_bool("AD_USE_SSL", True),
+        domain=os.environ.get("AD_DOMAIN", ""),
+        base_dn=os.environ.get("AD_BASE_DN", ""),
+        user_search_base=os.environ.get("AD_USER_SEARCH_BASE") or os.environ.get("AD_BASE_DN", ""),
+        group_search_base=os.environ.get("AD_GROUP_SEARCH_BASE") or os.environ.get("AD_BASE_DN", ""),
+        bind_user=os.environ.get("AD_BIND_USER") or None,
+        bind_password=os.environ.get("AD_BIND_PASSWORD") or None,
+    )
+
+
+def get_session_settings() -> SessionSettings:
+    secret = os.environ.get("SESSION_SECRET_KEY", "")
+    if not secret:
+        # Не поднимаем сервис без секрета сессий в проде, но не мешаем читать
+        # settings.py в контексте, где сессии не используются (например,
+        # collector). Реальная проверка "секрет не дефолтный" — на старте веба.
+        secret = "INSECURE-DEV-ONLY-SECRET-DO-NOT-USE-IN-PRODUCTION"
+    return SessionSettings(
+        secret_key=secret,
+        lifetime_minutes=_env_int("SESSION_LIFETIME_MINUTES", 480),
+        cookie_secure=_env_bool("SESSION_COOKIE_SECURE", False),
+    )
