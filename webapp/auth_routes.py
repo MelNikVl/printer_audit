@@ -8,7 +8,8 @@ from printaudit.ad.client import ADAuthError, ADClient, ADError
 from printaudit.ad_settings import get_session_settings
 from printaudit.models import AppUser
 from printaudit.security.sessions import SESSION_COOKIE_NAME, create_session, revoke_session
-from webapp.deps import csrf_token, get_ad_client, get_client_ip, get_db, require_csrf
+from webapp.deps import csrf_token, get_ad_client, get_client_ip, get_db, require_csrf, safe_next_path
+from webapp.errors import safe_error_message
 from webapp.templating import templates
 
 router = APIRouter()
@@ -18,7 +19,7 @@ router = APIRouter()
 def login_page(request: Request, next: str = "/"):
     return templates.TemplateResponse(
         "login.html",
-        {"request": request, "csrf_token": csrf_token(request), "next": next, "error": None},
+        {"request": request, "csrf_token": csrf_token(request), "next": safe_next_path(next), "error": None},
     )
 
 
@@ -31,10 +32,12 @@ def login_submit(
     db: Session = Depends(get_db),
     ad_client: ADClient = Depends(get_ad_client),
 ):
+    safe_next = safe_next_path(next)
+
     def _error(message: str, status_code: int):
         return templates.TemplateResponse(
             "login.html",
-            {"request": request, "csrf_token": csrf_token(request), "next": next, "error": message},
+            {"request": request, "csrf_token": csrf_token(request), "next": safe_next, "error": message},
             status_code=status_code,
         )
 
@@ -46,7 +49,7 @@ def login_submit(
     except ADAuthError:
         return _error("Неверный логин или пароль.", 401)
     except ADError as exc:
-        return _error(f"Не удалось связаться с Active Directory: {exc}", 503)
+        return _error(safe_error_message(exc, "вход через AD"), 503)
 
     app_user = db.query(AppUser).filter_by(login_normalized=principal.login_normalized).first()
     if app_user is None and principal.sid:
@@ -69,7 +72,7 @@ def login_submit(
         db, app_user, ip_address=get_client_ip(request), user_agent=request.headers.get("user-agent")
     )
     session_settings = get_session_settings()
-    redirect = RedirectResponse(url=next or "/", status_code=303)
+    redirect = RedirectResponse(url=safe_next, status_code=303)
     redirect.set_cookie(
         SESSION_COOKIE_NAME,
         token,

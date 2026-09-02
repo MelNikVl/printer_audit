@@ -10,7 +10,9 @@
 admin/superadmin (см. webapp/admin_routes.py)."""
 import csv
 import io
+import os
 import sys
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -25,6 +27,7 @@ from sqlalchemy.orm import Session  # noqa: E402
 from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa: E402
 
 from printaudit import queries  # noqa: E402
+from printaudit.ad_settings import validate_session_secret  # noqa: E402
 from printaudit.config import get_settings  # noqa: E402
 from printaudit.models import AppUser  # noqa: E402
 from webapp import admin_routes, auth_routes  # noqa: E402
@@ -33,7 +36,22 @@ from webapp.errors import Forbidden, NotAuthenticated  # noqa: E402
 from webapp.middleware import CsrfCookieMiddleware  # noqa: E402
 from webapp.templating import BASE_DIR, templates  # noqa: E402
 
-app = FastAPI(title="Print Audit")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Fail closed: без настоящего SESSION_SECRET_KEY сервер вообще не
+    # поднимается (не "поднимается с предупреждением в лог", которое никто
+    # не читает) -- см. printaudit/ad_settings.py::validate_session_secret
+    # для точных условий (не задан / плейсхолдер CHANGE_ME / совпадает с
+    # dev-заглушкой из исходников / короче 32 символов). Намеренно НЕ в
+    # printaudit.ad_settings.get_session_settings() -- она нужна и
+    # collector'у/CLI-скриптам, которым веб-сессии не нужны вообще, и им не
+    # следует падать из-за отсутствия этой переменной.
+    validate_session_secret(os.environ.get("SESSION_SECRET_KEY"))
+    yield
+
+
+app = FastAPI(title="Print Audit", lifespan=lifespan)
 app.add_middleware(CsrfCookieMiddleware)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 

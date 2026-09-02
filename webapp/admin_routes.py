@@ -38,6 +38,7 @@ from printaudit.printers.discovery import PrinterDiscoveryError, sync_printer_qu
 from printaudit.printers.resolver import resolve_price
 from printaudit.timeutil import utcnow
 from webapp.deps import csrf_token, get_ad_client, get_client_ip, get_db, require_csrf, require_role
+from webapp.errors import safe_error_message
 from webapp.templating import templates
 
 router = APIRouter(prefix="/admin")
@@ -121,7 +122,7 @@ def admin_administrators(
         try:
             ad_results = ad_client.search_users(q.strip())
         except ADError as exc:
-            ad_search_error = str(exc)
+            ad_search_error = safe_error_message(exc, "поиск пользователей в AD")
     return templates.TemplateResponse(
         "admin/administrators.html",
         {
@@ -322,7 +323,7 @@ def admin_ad_users(
         try:
             ad_results = ad_client.search_users(q.strip())
         except ADError as exc:
-            ad_search_error = str(exc)
+            ad_search_error = safe_error_message(exc, "поиск пользователей в AD")
     imported_logins = {u.login_normalized for u in imported}
     return templates.TemplateResponse(
         "admin/ad_users.html",
@@ -475,7 +476,7 @@ def admin_ad_groups(
         try:
             ad_results = ad_client.search_groups(q.strip())
         except ADError as exc:
-            ad_search_error = str(exc)
+            ad_search_error = safe_error_message(exc, "поиск групп в AD")
     imported_dns = {g.dn for g in groups}
     return templates.TemplateResponse(
         "admin/ad_groups.html",
@@ -523,7 +524,7 @@ def admin_ad_groups_sync_members(
     try:
         members = ad_client.get_group_members(group.dn)
     except ADError as exc:
-        return _redirect("/admin/ad-groups", err=f"Не удалось получить членов группы: {exc}")
+        return _redirect("/admin/ad-groups", err=safe_error_message(exc, "синхронизация участников группы AD"))
 
     current_ids = set()
     for principal in members:
@@ -655,7 +656,7 @@ def admin_printers_discover(
             )
         )
         db.commit()
-        return _redirect("/admin/printers", err=f"Обнаружение очередей не удалось: {exc}")
+        return _redirect("/admin/printers", err=safe_error_message(exc, "обнаружение очередей печати"))
 
     db.add(
         SyncRun(

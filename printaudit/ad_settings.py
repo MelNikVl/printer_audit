@@ -56,6 +56,47 @@ class ADSettings:
         return bool(self.server and self.base_dn)
 
 
+DEV_INSECURE_SESSION_SECRET = "INSECURE-DEV-ONLY-SECRET-DO-NOT-USE-IN-PRODUCTION"
+MIN_SESSION_SECRET_LENGTH = 32
+
+
+class InsecureSessionSecretError(RuntimeError):
+    """SESSION_SECRET_KEY отсутствует или явно небезопасен. Поднимается ТОЛЬКО
+    веб-приложением на старте (см. webapp/main.py -- lifespan) -- не
+    вызывается из get_session_settings()/create_session()/и т.п., чтобы
+    collector и CLI-скрипты (bootstrap_superadmin.py и другие), которым
+    веб-сессии не нужны вообще, не падали из-за отсутствия этой переменной."""
+
+
+def validate_session_secret(raw_secret: Optional[str]) -> None:
+    """Проверяет СЫРОЕ значение SESSION_SECRET_KEY из окружения (не то, что
+    вернул get_session_settings() -- там уже подставлена dev-заглушка, и
+    разделить "не задан" и "явно указан плейсхолдер" было бы нельзя)."""
+    if not raw_secret:
+        raise InsecureSessionSecretError(
+            "SESSION_SECRET_KEY не задан. Сгенерируйте случайный секрет:\n"
+            '    python -c "import secrets; print(secrets.token_urlsafe(48))"\n'
+            "и добавьте в .env (см. .env.example)."
+        )
+    if "CHANGE_ME" in raw_secret.upper():
+        raise InsecureSessionSecretError(
+            "SESSION_SECRET_KEY похож на плейсхолдер из .env.example (содержит 'CHANGE_ME'). "
+            "Сгенерируйте реальный секрет и замените значение в .env."
+        )
+    if raw_secret == DEV_INSECURE_SESSION_SECRET:
+        raise InsecureSessionSecretError(
+            "SESSION_SECRET_KEY совпадает со встроенным dev-значением по умолчанию — "
+            "это НЕ секрет, а публично известная строка из исходного кода. Задайте "
+            "свой уникальный секрет в .env."
+        )
+    if len(raw_secret) < MIN_SESSION_SECRET_LENGTH:
+        raise InsecureSessionSecretError(
+            f"SESSION_SECRET_KEY слишком короткий ({len(raw_secret)} символов, "
+            f"минимум {MIN_SESSION_SECRET_LENGTH}). Сгенерируйте:\n"
+            '    python -c "import secrets; print(secrets.token_urlsafe(48))"'
+        )
+
+
 @dataclass
 class SessionSettings:
     secret_key: str
@@ -82,8 +123,10 @@ def get_session_settings() -> SessionSettings:
     if not secret:
         # Не поднимаем сервис без секрета сессий в проде, но не мешаем читать
         # settings.py в контексте, где сессии не используются (например,
-        # collector). Реальная проверка "секрет не дефолтный" — на старте веба.
-        secret = "INSECURE-DEV-ONLY-SECRET-DO-NOT-USE-IN-PRODUCTION"
+        # collector, bootstrap_superadmin.py). Реальная fail-closed проверка —
+        # webapp/main.py (lifespan) вызывает validate_session_secret() на
+        # СЫРОЕ значение до того, как сюда попадёт эта заглушка.
+        secret = DEV_INSECURE_SESSION_SECRET
     return SessionSettings(
         secret_key=secret,
         lifetime_minutes=_env_int("SESSION_LIFETIME_MINUTES", 480),
