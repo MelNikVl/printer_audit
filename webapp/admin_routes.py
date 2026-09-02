@@ -15,8 +15,14 @@ from sqlalchemy.orm import Session
 from printaudit import roles
 from printaudit.ad.client import ADClient, ADError
 from printaudit.ad_normalize import normalize_login
-from printaudit.ad_settings import get_ad_settings
-from printaudit.admin_users import AdminActionError, delete_admin_assignment, disable_admin, upsert_admin_assignment
+from printaudit.ad_settings import AuthAvailability, get_ad_settings
+from printaudit.admin_users import (
+    AdminActionError,
+    create_local_user,
+    delete_admin_assignment,
+    disable_admin,
+    upsert_admin_assignment,
+)
 from printaudit.audit import record as audit_record
 from printaudit.config import get_settings
 from printaudit.department_resolver import apply_ad_department_sync, plan_ad_department_sync
@@ -37,7 +43,15 @@ from printaudit.models import User as LegacyUser
 from printaudit.printers.discovery import PrinterDiscoveryError, sync_printer_queues
 from printaudit.printers.resolver import resolve_price
 from printaudit.timeutil import utcnow
-from webapp.deps import csrf_token, get_ad_client, get_client_ip, get_db, require_csrf, require_role
+from webapp.deps import (
+    csrf_token,
+    get_ad_client,
+    get_auth_availability_dep,
+    get_client_ip,
+    get_db,
+    require_csrf,
+    require_role,
+)
 from webapp.errors import safe_error_message
 from webapp.templating import templates
 
@@ -115,10 +129,13 @@ def admin_administrators(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_role(roles.SUPERADMIN)),
     ad_client: ADClient = Depends(get_ad_client),
+    auth_availability: AuthAvailability = Depends(get_auth_availability_dep),
 ):
     admins = db.query(AppUser).order_by(AppUser.role.desc(), AppUser.login_normalized).all()
     ad_results, ad_search_error = [], None
-    if q.strip():
+    # Ни одного обращения к LDAP, если AD выключен -- ad_client.search_users()
+    # не вызывается вообще, не только "вызывается и ошибка скрывается".
+    if auth_availability.ad_enabled and q.strip():
         try:
             ad_results = ad_client.search_users(q.strip())
         except ADError as exc:
@@ -128,8 +145,37 @@ def admin_administrators(
         {
             "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
             "admins": admins, "q": q, "ad_results": ad_results, "ad_search_error": ad_search_error,
-            "all_roles": roles.ALL_ROLES,
+            "all_roles": roles.ALL_ROLES, "auth": auth_availability,
         },
+    )
+
+
+@router.post("/administrators/create-local", dependencies=[Depends(require_csrf)])
+def admin_administrators_create_local(
+    request: Request,
+    login: str = Form(...),
+    role: Literal["viewer", "admin", "superadmin"] = Form(...),
+    display_name: str = Form(""),
+    email: str = Form(""),
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_role(roles.SUPERADMIN)),
+):
+    try:
+        user, temp_password = create_local_user(
+            db, actor=current_user, login=login, role=role,
+            display_name=display_name or None, email=email or None,
+            ip_address=get_client_ip(request),
+        )
+    except AdminActionError as exc:
+        db.rollback()
+        return _redirect("/admin/administrators", err=str(exc))
+    db.commit()
+    return _redirect(
+        "/admin/administrators",
+        msg=(
+            f"Локальный пользователь {user.login_normalized} создан. Временный пароль "
+            f"(показывается один раз, скопируйте и передайте пользователю): {temp_password}"
+        ),
     )
 
 
@@ -315,11 +361,12 @@ def admin_ad_users(
     request: Request, q: str = "",
     db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
     ad_client: ADClient = Depends(get_ad_client),
+    auth_availability: AuthAvailability = Depends(get_auth_availability_dep),
 ):
     imported = db.query(AdUser).order_by(AdUser.login_normalized).all()
     departments = db.query(Department).filter_by(is_active=True).order_by(Department.name).all()
     ad_results, ad_search_error = [], None
-    if q.strip():
+    if auth_availability.ad_enabled and q.strip():
         try:
             ad_results = ad_client.search_users(q.strip())
         except ADError as exc:
@@ -331,6 +378,7 @@ def admin_ad_users(
             "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
             "imported": imported, "departments": departments, "q": q,
             "ad_results": ad_results, "ad_search_error": ad_search_error, "imported_logins": imported_logins,
+            "auth": auth_availability,
         },
     )
 
@@ -425,7 +473,10 @@ def admin_ad_users_resync(
     request: Request,
     db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
     ad_client: ADClient = Depends(get_ad_client),
+    auth_availability: AuthAvailability = Depends(get_auth_availability_dep),
 ):
+    if not auth_availability.ad_enabled:
+        return _redirect("/admin/ad-users", err="AD отключён — синхронизация недоступна.")
     started = utcnow()
     updated, errors = 0, 0
     for ad_user in db.query(AdUser).all():
@@ -462,6 +513,7 @@ def admin_ad_groups(
     request: Request, q: str = "",
     db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
     ad_client: ADClient = Depends(get_ad_client),
+    auth_availability: AuthAvailability = Depends(get_auth_availability_dep),
 ):
     groups = db.query(AdGroup).order_by(AdGroup.display_name).all()
     rules_by_group = {r.ad_group_id: r for r in db.query(AdDepartmentRule).all()}
@@ -472,7 +524,7 @@ def admin_ad_groups(
     )
     departments = db.query(Department).filter_by(is_active=True).order_by(Department.name).all()
     ad_results, ad_search_error = [], None
-    if q.strip():
+    if auth_availability.ad_enabled and q.strip():
         try:
             ad_results = ad_client.search_groups(q.strip())
         except ADError as exc:
@@ -484,7 +536,7 @@ def admin_ad_groups(
             "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
             "groups": groups, "rules_by_group": rules_by_group, "member_counts": member_counts,
             "departments": departments, "q": q, "ad_results": ad_results, "ad_search_error": ad_search_error,
-            "imported_dns": imported_dns,
+            "imported_dns": imported_dns, "auth": auth_availability,
         },
     )
 
@@ -517,7 +569,10 @@ def admin_ad_groups_sync_members(
     group_id: int, request: Request,
     db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
     ad_client: ADClient = Depends(get_ad_client),
+    auth_availability: AuthAvailability = Depends(get_auth_availability_dep),
 ):
+    if not auth_availability.ad_enabled:
+        return _redirect("/admin/ad-groups", err="AD отключён — синхронизация недоступна.")
     group = db.get(AdGroup, group_id)
     if group is None:
         return _redirect("/admin/ad-groups", err="Группа не найдена")

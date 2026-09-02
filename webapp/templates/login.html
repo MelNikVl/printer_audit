@@ -9,18 +9,55 @@
 <body>
 <div class="login-wrap">
   <h1>Print Audit</h1>
+
+  {% if request.query_params.get("msg") %}
+  <div class="flash flash-ok">{{ request.query_params.get("msg") }}</div>
+  {% endif %}
   {% if error %}
   <div class="login-error">{{ error }}</div>
   {% endif %}
-  <form method="post" action="/login">
+
+  {% if not auth.local_enabled and not auth.ad_enabled %}
+  <div class="login-error">Вход временно недоступен: ни один способ входа не включён. Обратитесь к администратору.</div>
+  {% else %}
+
+  {% set default_provider = provider or ("local" if auth.local_enabled else "ad") %}
+
+  {% if auth.local_enabled and auth.ad_enabled %}
+  <div class="login-tabs">
+    <button type="button" class="login-tab" id="tab-local" onclick="selectProvider('local')">Локальная учётная запись</button>
+    <button type="button" class="login-tab" id="tab-ad" onclick="selectProvider('ad')">Active Directory</button>
+  </div>
+  {% endif %}
+
+  <form method="post" action="/login" id="login-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="next" value="{{ next }}">
-    <label>Логин AD</label>
-    <input type="text" name="login" placeholder="DOMAIN\login или login@domain" autofocus required>
+    <input type="hidden" name="provider" id="provider-field" value="{{ default_provider }}">
+    <label id="login-label">Логин</label>
+    <input type="text" name="login" id="login-input" placeholder="логин" autofocus required>
     <label>Пароль</label>
     <input type="password" name="password" required>
     <button type="submit">Войти</button>
   </form>
+  {% endif %}
 </div>
+
+<script>
+function selectProvider(p) {
+  document.getElementById('provider-field').value = p;
+  document.getElementById('tab-local').classList.toggle('active', p === 'local');
+  document.getElementById('tab-ad').classList.toggle('active', p === 'ad');
+  const input = document.getElementById('login-input');
+  if (p === 'ad') {
+    input.placeholder = 'DOMAIN\\login или login@domain';
+  } else {
+    input.placeholder = 'логин';
+  }
+}
+{% if auth.local_enabled and auth.ad_enabled %}
+selectProvider('{{ default_provider }}');
+{% endif %}
+</script>
 </body>
 </html>
