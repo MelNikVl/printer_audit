@@ -9,6 +9,7 @@ from printaudit.ad_settings import get_session_settings
 from printaudit.models import AppUser
 from printaudit.security.sessions import SESSION_COOKIE_NAME, create_session, revoke_session
 from webapp.deps import csrf_token, get_ad_client, get_client_ip, get_db, require_csrf, safe_next_path
+from webapp.errors import safe_error_message
 from webapp.templating import templates
 
 router = APIRouter()
@@ -48,7 +49,7 @@ def login_submit(
     except ADAuthError:
         return _error("Неверный логин или пароль.", 401)
     except ADError as exc:
-        return _error(f"Не удалось связаться с Active Directory: {exc}", 503)
+        return _error(safe_error_message(exc, "вход через AD"), 503)
 
     app_user = db.query(AppUser).filter_by(login_normalized=principal.login_normalized).first()
     if app_user is None and principal.sid:
