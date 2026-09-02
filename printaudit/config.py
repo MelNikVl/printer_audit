@@ -39,6 +39,9 @@ class Settings:
         self.max_events_per_run = int(collector.get("max_events_per_run", 5000))
         self.field_map = collector.get("field_map", {}) or {}
 
+        # "full" (по умолчанию, поведение MVP) | "masked" | "none" — см. printaudit/privacy.py
+        self.document_name_policy = str(data.get("document_name_policy", "full"))
+
 
 _settings: "Settings | None" = None
 

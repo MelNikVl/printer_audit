@@ -5,13 +5,21 @@ deploy/register_collector_task.ps1). Каждый запуск:
   1. читает курсор last_record_id из таблицы collector_state;
   2. вызывает Export-PrintEvents.ps1, который отдаёт JSON с новыми событиями;
   3. разбирает поля события по collector.field_map из config.yaml;
-  4. подбирает отдел (по users) и тариф (по price_list);
-  5. пишет новые задания в print_jobs и продвигает курсор.
+  4. резолвит очередь печати (создаёт как discovered/unconfigured, если её
+     ещё не видела синхронизация Get-Printer), тариф и отдел (сперва по AD,
+     затем легаси-CSV);
+  5. пишет новые задания в print_jobs и продвигает курсор;
+  6. пишет запись о самом прогоне в sync_runs (успех/ошибка, счётчики) —
+     это то, что показывается в /admin (Обзор).
 
 Идемпотентность: курсор (EventRecordID) не позволяет обработать событие дважды
 при штатной работе; на случай повторного запуска/сбоя после частичной вставки
 дополнительно стоит UNIQUE(site_code, record_id) на уровне БД и проверка
-существования записи перед вставкой.
+существования записи перед вставкой. Курсор продвигается и sync_runs
+помечается success только если весь прогон дошёл до конца без исключения —
+при сбое пишется отдельная запись sync_runs со status="failed" в отдельной
+транзакции (см. _record_failed_run), потому что основная транзакция в этот
+момент уже откатывается.
 """
 import argparse
 import json
@@ -23,10 +31,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from printaudit.ad_normalize import normalize_login  # noqa: E402
+from printaudit.ad_settings import get_ad_settings  # noqa: E402
 from printaudit.config import get_settings  # noqa: E402
 from printaudit.database import SessionLocal  # noqa: E402
-from printaudit.models import CollectorState, PrintJob, User  # noqa: E402
-from printaudit.pricing import match_price  # noqa: E402
+from printaudit.department_resolver import lookup_department_for_print_job_user  # noqa: E402
+from printaudit.models import CollectorState, PrintJob, SyncRun  # noqa: E402
+from printaudit.printers.resolver import get_or_create_printer_queue, resolve_price  # noqa: E402
+from printaudit.privacy import apply_document_name_policy  # noqa: E402
 
 PS_SCRIPT = Path(__file__).resolve().parent / "Export-PrintEvents.ps1"
 
@@ -151,9 +163,32 @@ def get_or_create_state(session, site_code: str) -> CollectorState:
     return state
 
 
+def _record_failed_run(settings, started_at, error_message: str) -> None:
+    """Пишет неуспешный прогон в sync_runs ОТДЕЛЬНОЙ транзакцией/сессией —
+    основная сессия к этому моменту уже откатывается, и любая запись,
+    добавленная в неё, будет потеряна вместе с rollback."""
+    session = SessionLocal()
+    try:
+        session.add(
+            SyncRun(
+                run_type="collector",
+                site_code=settings.site_code,
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                status="failed",
+                error_message=error_message[:2000],
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
 def run_once() -> None:
     settings = get_settings()
+    ad_settings = get_ad_settings()
     log = setup_logging(settings.log_dir)
+    run_started_at = datetime.now(timezone.utc)
     session = SessionLocal()
     try:
         state = get_or_create_state(session, settings.site_code)
@@ -204,16 +239,29 @@ def run_once() -> None:
                 skipped += 1
                 continue
 
-            user = session.get(User, user_name)
-            if user is None:
-                user = User(user_name=user_name, department_id=None, is_active=True)
-                session.add(user)
-                session.flush()
+            time_created = datetime.strptime(evt["TimeCreated"], "%Y-%m-%dT%H:%M:%S.%f%z")
 
-            price_per_page, is_color, _currency = match_price(session, printer_name, settings)
+            # Очередь печати: если её ещё не видела синхронизация Get-Printer
+            # (/admin -> Принтеры -> "Обнаружить очереди"), заводим сами как
+            # discovered/unconfigured — учёт не блокируется отсутствием ручной настройки.
+            printer_queue = get_or_create_printer_queue(session, printer_name)
+            if not printer_queue.collection_enabled:
+                log.info(
+                    "RecordId=%s: учёт для очереди '%s' отключён (collection_enabled=False) — пропущено.",
+                    record_id, printer_name,
+                )
+                skipped += 1
+                continue
+            printer_queue.last_job_at = time_created
+
+            price_per_page, is_color, _currency, price_rule_id = resolve_price(
+                session, printer_queue, time_created, settings
+            )
             cost = round(total_pages * price_per_page, 2)
 
-            time_created = datetime.strptime(evt["TimeCreated"], "%Y-%m-%dT%H:%M:%S.%f%z")
+            department_id = lookup_department_for_print_job_user(
+                session, user_name, ad_domain=ad_settings.domain or None
+            )
 
             job = PrintJob(
                 site_code=settings.site_code,
@@ -221,11 +269,14 @@ def run_once() -> None:
                 job_id=str(job_id) if job_id is not None else None,
                 time_created=time_created,
                 user_name=user_name,
-                document_name=document_name,
+                user_login_normalized=normalize_login(user_name),
+                document_name=apply_document_name_policy(document_name, settings.document_name_policy),
                 printer_name=printer_name,
                 total_pages=total_pages,
                 is_color=is_color,
-                department_id=user.department_id,
+                department_id=department_id,
+                printer_queue_id=printer_queue.id,
+                price_rule_id=price_rule_id,
                 price_per_page=price_per_page,
                 cost=cost,
             )
@@ -234,14 +285,28 @@ def run_once() -> None:
 
         state.last_record_id = max_record_id
         state.last_run_at = datetime.now(timezone.utc)
+        session.add(
+            SyncRun(
+                run_type="collector",
+                site_code=settings.site_code,
+                started_at=run_started_at,
+                finished_at=datetime.now(timezone.utc),
+                status="success",
+                events_fetched=len(events),
+                inserted=inserted,
+                skipped=skipped,
+                duplicates=duplicates,
+            )
+        )
         session.commit()
         log.info(
             "Готово. вставлено=%d пропущено=%d дублей=%d новый_курсор=%s",
             inserted, skipped, duplicates, max_record_id,
         )
-    except Exception:
+    except Exception as exc:
         session.rollback()
         log.exception("Сбой при сборе событий печати")
+        _record_failed_run(settings, run_started_at, str(exc))
         raise
     finally:
         session.close()
