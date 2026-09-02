@@ -31,6 +31,56 @@ from printaudit.pricing import match_price  # noqa: E402
 PS_SCRIPT = Path(__file__).resolve().parent / "Export-PrintEvents.ps1"
 
 
+class FieldMapError(ValueError):
+    """collector.field_map указывает на индекс, которого нет в Properties события —
+    почти всегда означает, что калибровку (calibrate_event_fields.ps1) не проводили
+    или проводили на другой версии Windows Server/драйвера. См. docs/ADMIN_GUIDE.md."""
+
+
+def parse_export_output(raw: str) -> list:
+    """Разбирает stdout Export-PrintEvents.ps1 в список событий (list[dict]).
+
+    Контракт: скрипт ДОЛЖЕН отдавать JSON-массив всегда — при 0, 1 и N событиях.
+    На практике встречался баг, когда `ConvertTo-Json` разворачивал переданный
+    через pipe массив из ровно одного элемента и отдавал JSON-объект вместо
+    массива (PowerShell разворачивает коллекции в пайплайне поэлементно).
+    Этот разбор на стороне Python — вторая линия защиты: даже если PowerShell
+    когда-нибудь снова отдаст «голый» объект, мы аккуратно оборачиваем его в
+    список, а любой другой неожиданный формат превращаем в понятную ошибку,
+    а не в TypeError при итерации.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        snippet = raw[:500]
+        raise RuntimeError(
+            f"Export-PrintEvents.ps1 вернул невалидный JSON: {exc}. "
+            f"Начало вывода: {snippet!r}"
+        ) from exc
+
+    if isinstance(data, dict):
+        # Один объект вместо массива (см. docstring выше) — нормализуем.
+        data = [data]
+
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"Export-PrintEvents.ps1 вернул JSON неожиданного типа "
+            f"{type(data).__name__} (ожидался массив событий)."
+        )
+
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                f"Export-PrintEvents.ps1: элемент #{i} в массиве событий имеет тип "
+                f"{type(item).__name__}, ожидался объект события."
+            )
+
+    return data
+
+
 def setup_logging(log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("collector")
@@ -63,14 +113,32 @@ def fetch_events(log_name: str, event_id: int, after_record_id: int, max_events:
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if result.returncode != 0:
         raise RuntimeError(f"Export-PrintEvents.ps1 завершился с ошибкой: {result.stderr.strip()}")
-    output = result.stdout.strip() or "[]"
-    return json.loads(output)
+    return parse_export_output(result.stdout)
 
 
-def get_field(properties: list, field_map: dict, name: str, default=None):
+def get_field(properties: list, field_map: dict, name: str, default=None, required_index=False):
+    """Достаёт значение поля `name` из Properties события по индексу из field_map.
+
+    Если поле не упомянуто в field_map — считается необязательным, возвращается
+    `default` без ошибки (например, job_id). Если поле упомянуто, но индекс
+    выходит за пределы фактического списка Properties — это почти всегда
+    признак неоткалиброванного field_map (индексы поля различаются между
+    Windows Server 2016/2019/2022 и версией драйвера, см. docs/ADMIN_GUIDE.md),
+    и вместо тихого None лучше явно сообщить об этом (FieldMapError), чтобы
+    ошибка калибровки была видна в логе, а не превращалась в пустые/нулевые
+    значения в отчётах.
+    """
     idx = field_map.get(name)
-    if idx is None or idx >= len(properties):
+    if idx is None:
         return default
+    if idx < 0 or idx >= len(properties):
+        raise FieldMapError(
+            f"collector.field_map.{name}={idx} вне диапазона: событие содержит "
+            f"только {len(properties)} свойств (индексы 0..{len(properties) - 1}). "
+            f"Индексы полей отличаются между серверами/драйверами — запустите "
+            f"collector/calibrate_event_fields.ps1 на этом сервере и поправьте "
+            f"config.yaml (см. docs/ADMIN_GUIDE.md, раздел 3)."
+        )
     return properties[idx]
 
 
