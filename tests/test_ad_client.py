@@ -162,3 +162,121 @@ def test_service_connection_required_for_search_without_bind_user():
     client = ADClient(settings)
     with pytest.raises(ADError):
         client.search_users("ivanov")
+
+
+# ---------------------------------------------------------------------------
+# LDAP filter injection — user-controlled input (search query, sAMAccountName,
+# group DN) must be escaped via ldap3.utils.conv.escape_filter_chars before
+# being embedded in any filter. All of these must be handled SAFELY (no
+# exception, no "matches everyone") rather than just "not crash".
+# ---------------------------------------------------------------------------
+
+LDAP_INJECTION_PAYLOADS = [
+    "*",                        # wildcard — would turn "(attr=X)" into "match anyone with attr"
+    "*)(objectClass=*",         # classic LDAP injection: close the clause, inject an always-true one
+    "*)(|(objectClass=*",       # same idea with an OR
+    ")(uid=*",                  # attempt to close+reopen a clause
+    "\\",                       # bare backslash — ldap3's escaped-hex-sequence marker
+    "(",
+    ")",
+    "admin)(&(1=1",
+]
+
+
+class _RecordingConnection:
+    """Соединение-шпион: не бьёт по сети/моку, а просто запоминает фильтр,
+    который ADClient реально отправил бы в conn.search(). Нужно потому, что
+    ldap3's MOCK_SYNC сам содержит известный баг: substring-фильтр вида
+    "(attr=*\\28*)" (экранированное значение внутри "*...*") у него матчит
+    ЛЮБУЮ запись, хотя реальный AD корректно декодирует \\28 в буквальный "("
+    и ищет его как подстроку (в тестовых данных такой подстроки нет —
+    подтверждено отдельно: тот же escape для ТОЧНОГО совпадения, как в
+    get_user_by_login, MOCK_SYNC матчит правильно, см. тесты ниже). Поэтому
+    для substring-фильтров (search_users/search_groups) проверяем сам факт
+    экранирования напрямую по строке фильтра — это точнее и не зависит от
+    того, насколько добросовестно мок реализует RFC 4515."""
+
+    def __init__(self):
+        self.last_filter = None
+        self.entries = []
+
+    def search(self, base, filter_string, **kwargs):
+        self.last_filter = filter_string
+        return True
+
+    def unbind(self):
+        pass
+
+
+def _settings_for_recording():
+    return ADSettings(
+        server="mock-dc", port=636, use_ssl=True, domain="example.local",
+        base_dn="dc=example,dc=local", user_search_base=USERS_OU, group_search_base=GROUPS_OU,
+        bind_user="cn=admin,dc=example,dc=local", bind_password="x",
+    )
+
+
+@pytest.mark.parametrize("payload", LDAP_INJECTION_PAYLOADS)
+def test_search_users_escapes_payload_in_sent_filter(payload):
+    from ldap3.utils.conv import escape_filter_chars
+
+    recorder = _RecordingConnection()
+    client = ADClient(_settings_for_recording(), service_connection_factory=lambda: recorder)
+    client.search_users(payload)
+
+    expected_value = escape_filter_chars(payload)
+    sent = recorder.last_filter
+    assert sent is not None
+    # Экранированное значение должно быть в фильтре ровно как есть (для всех
+    # 4 OR'нутых атрибутов), и наоборот — "сырой" payload с непревращёнными
+    # спецсимволами не должен присутствовать нигде в отправленном фильтре
+    # (иначе это значит, что где-то он попал туда неэкранированным).
+    assert sent.count(f"*{expected_value}*") == 4
+    # Синтаксическая валидность на уровне баланса скобок — простая проверка,
+    # что мы не оставили в фильтре "живую" непарную скобку из payload
+    # (payload может легитимно СОВПАДАТЬ по символам с частями синтаксиса
+    # фильтра — например payload="(" — поэтому не проверяем "payload not in
+    # sent" буквально, а полагаемся на count() выше плюс баланс скобок).
+    assert sent.count("(") == sent.count(")")
+
+
+@pytest.mark.parametrize("payload", LDAP_INJECTION_PAYLOADS)
+def test_search_groups_escapes_payload_in_sent_filter(payload):
+    from ldap3.utils.conv import escape_filter_chars
+
+    recorder = _RecordingConnection()
+    client = ADClient(_settings_for_recording(), service_connection_factory=lambda: recorder)
+    client.search_groups(payload)
+
+    expected_value = escape_filter_chars(payload)
+    sent = recorder.last_filter
+    assert sent is not None
+    assert sent.count(f"*{expected_value}*") == 2
+    assert sent.count("(") == sent.count(")")
+
+
+def test_get_user_by_login_with_bare_wildcard_matches_nobody(mock_ad):
+    """Без экранирования login="*" превратил бы sAMAccountName-фильтр в
+    "(sAMAccountName=*)" — матчит ЛЮБОГО пользователя с этим атрибутом, и
+    get_user_by_login вернул бы первого попавшегося (де-факто чужую учётку)
+    вместо None. С экранированием "*" ищется как буквальный символ."""
+    assert mock_ad.get_user_by_login("*") is None
+
+
+@pytest.mark.parametrize("payload", LDAP_INJECTION_PAYLOADS)
+def test_get_user_by_login_with_injection_payload_is_safe(mock_ad, payload):
+    assert mock_ad.get_user_by_login(payload) is None
+
+
+@pytest.mark.parametrize("payload", LDAP_INJECTION_PAYLOADS)
+def test_get_group_members_with_injected_dn_is_safe(mock_ad, payload):
+    malicious_dn = f"cn=x,dc=example,dc=local{payload}"
+    members = mock_ad.get_group_members(malicious_dn)
+    assert members == []
+
+
+def test_authenticate_sam_lookup_with_wildcard_password_does_not_bypass(mock_ad):
+    """login="*" не должен позволить войти под чужой учёткой ни через bind
+    (UPN "*@example.local" не существует), ни через последующий поиск."""
+    with pytest.raises(ADAuthError):
+        mock_ad.authenticate("*", "irrelevant")

@@ -12,6 +12,7 @@ from typing import Callable, List, Optional
 
 from ldap3 import ALL, SUBTREE, Connection, Server
 from ldap3.core.exceptions import LDAPBindError, LDAPException
+from ldap3.utils.conv import escape_filter_chars
 
 from printaudit.ad_normalize import normalize_login, split_login
 from printaudit.ad_settings import ADSettings
@@ -169,7 +170,7 @@ class ADClient:
             search_base = self.settings.user_search_base or self.settings.base_dn
             ok = conn.search(
                 search_base,
-                f"(sAMAccountName={sam})",
+                f"(sAMAccountName={escape_filter_chars(sam)})",
                 search_scope=SUBTREE,
                 attributes=USER_ATTRIBUTES,
             )
@@ -181,13 +182,21 @@ class ADClient:
 
     def search_users(self, query: str, limit: int = 25) -> List[ADPrincipal]:
         """Ищет пользователей по логину, отображаемому имени или email
-        (подстрока, регистр не важен — используется LDAP-фильтр с *)."""
+        (подстрока, регистр не важен — используется LDAP-фильтр с *).
+
+        `query` приходит от пользователя (форма поиска в /admin/ad-users) —
+        обязательно экранируется через escape_filter_chars() перед вставкой
+        в фильтр, иначе спецсимволы LDAP-фильтра (`*`, `(`, `)`, `\\`, NUL)
+        позволяют изменить смысл фильтра целиком (LDAP injection), а не
+        просто исказить результат поиска."""
         q = (query or "").strip()
         if not q:
             return []
+        q_escaped = escape_filter_chars(q)
         ldap_filter = (
             f"(&(objectClass=user)(objectCategory=person)(|"
-            f"(sAMAccountName=*{q}*)(displayName=*{q}*)(mail=*{q}*)(userPrincipalName=*{q}*)))"
+            f"(sAMAccountName=*{q_escaped}*)(displayName=*{q_escaped}*)"
+            f"(mail=*{q_escaped}*)(userPrincipalName=*{q_escaped}*)))"
         )
         conn = self._service_connection_factory()
         try:
@@ -208,7 +217,7 @@ class ADClient:
         try:
             conn.search(
                 self.settings.user_search_base or self.settings.base_dn,
-                f"(sAMAccountName={sam})",
+                f"(sAMAccountName={escape_filter_chars(sam)})",
                 search_scope=SUBTREE,
                 attributes=USER_ATTRIBUTES,
             )
@@ -222,7 +231,8 @@ class ADClient:
         q = (query or "").strip()
         if not q:
             return []
-        ldap_filter = f"(&(objectClass=group)(|(sAMAccountName=*{q}*)(displayName=*{q}*)))"
+        q_escaped = escape_filter_chars(q)
+        ldap_filter = f"(&(objectClass=group)(|(sAMAccountName=*{q_escaped}*)(displayName=*{q_escaped}*)))"
         conn = self._service_connection_factory()
         try:
             conn.search(
@@ -237,11 +247,18 @@ class ADClient:
             conn.unbind()
 
     def get_group_members(self, group_dn: str) -> List[ADPrincipal]:
+        # group_dn обычно приходит из ad_groups.dn (нашего кэша), но эта
+        # запись изначально заводится через форму импорта в /admin/ad-groups,
+        # где значение можно подделать напрямую POST-запросом — поэтому
+        # экранируем и здесь, а не только там, где явно видно текстовый ввод.
+        # escape_filter_chars() экранирует только спецсимволы ЗНАЧЕНИЯ ФИЛЬТРА
+        # (`\`, `*`, `(`, `)`, NUL) — запятые/равенства, законные для DN,
+        # не трогает, так что валидный DN как значение фильтра не портится.
         conn = self._service_connection_factory()
         try:
             conn.search(
                 self.settings.user_search_base or self.settings.base_dn,
-                f"(&(objectClass=user)(memberOf={group_dn}))",
+                f"(&(objectClass=user)(memberOf={escape_filter_chars(group_dn)}))",
                 search_scope=SUBTREE,
                 attributes=USER_ATTRIBUTES,
             )

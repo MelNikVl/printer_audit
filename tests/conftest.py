@@ -143,12 +143,20 @@ def db_env(tmp_path, monkeypatch):
     _reset_app_modules()
 
 
+# Валидный (по правилам validate_session_secret) секрет для тестов, которым
+# не важна сама эта проверка -- просто чтобы webapp поднимался. Тесты самой
+# проверки (test_session_secret_validation.py) НЕ используют эту fixture
+# как есть -- они явно управляют SESSION_SECRET_KEY через monkeypatch сами.
+TEST_SESSION_SECRET = "test-session-secret-not-for-production-" + "x" * 20
+
+
 @pytest.fixture
-def http_client(app_env):
+def http_client(app_env, monkeypatch):
     """TestClient для webapp.main.app, привязанный к той же изолированной БД,
     что app_env (webapp.* импортируется свежим ПОСЛЕ app_env, поэтому видит
     правильный printaudit.database). Использовать `login_as()` ниже, чтобы
     получить залогиненную сессию без реального AD."""
+    monkeypatch.setenv("SESSION_SECRET_KEY", TEST_SESSION_SECRET)
     from fastapi.testclient import TestClient
 
     import webapp.main as main

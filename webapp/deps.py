@@ -2,6 +2,7 @@
 роли, CSRF. Используются и отчётами, и /admin/*, и /api/* — без исключений:
 всё, что не относится к /login и статике, обязано пройти хотя бы require_login.
 """
+import re
 from typing import Optional
 
 from fastapi import Depends, Request
@@ -35,6 +36,37 @@ def get_client_ip(request: Request) -> str:
     if request.client:
         return request.client.host
     return ""
+
+
+_LEADING_CONTROL_OR_SPACE_RE = re.compile(r"^[\x00-\x20]+")
+
+
+def safe_next_path(raw: Optional[str]) -> str:
+    """Защита от open redirect в ?next=/POST-параметре next формы логина.
+
+    Разрешён ТОЛЬКО локальный абсолютный путь: начинается ровно с одного '/'
+    и не продолжается вторым '/' (в т.ч. после пробельных/управляющих
+    символов, которые браузер может проигнорировать) — что отсекает:
+      - протокол-относительные ссылки ("//evil.com" — браузер трактует как
+        тот же протокол + чужой хост);
+      - обратные слэши ("/\\evil.com", "\\\\evil.com" — браузеры трактуют
+        "\\" как "/" в URL, так что это тот же protocol-relative трюк в
+        другой записи);
+      - абсолютные URL с чужой схемой/хостом ("http://evil.com",
+        "javascript:...") — они не начинаются с "/" вообще.
+
+    Любое значение, не прошедшее проверку (включая пустое/отсутствующее),
+    заменяется на "/".
+    """
+    if not raw:
+        return "/"
+    candidate = raw.strip().replace("\\", "/")
+    if not candidate or candidate[0] != "/":
+        return "/"
+    rest = _LEADING_CONTROL_OR_SPACE_RE.sub("", candidate[1:])
+    if rest.startswith("/"):
+        return "/"
+    return candidate
 
 
 def csrf_token(request: Request) -> str:
