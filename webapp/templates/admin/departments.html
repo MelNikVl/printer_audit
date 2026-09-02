@@ -1,0 +1,51 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Отделы</h1>
+
+<table>
+  <tr><th>Название</th><th>Cost center</th><th>Описание</th><th>Порядок</th><th>Статус</th><th></th></tr>
+  {% for d in departments %}
+  <tr>
+    <td><input type="text" name="name" form="dept-form-{{ d.id }}" value="{{ d.name }}" required></td>
+    <td><input type="text" name="cost_center_code" form="dept-form-{{ d.id }}" value="{{ d.cost_center_code or '' }}"></td>
+    <td><input type="text" name="description" form="dept-form-{{ d.id }}" value="{{ d.description or '' }}"></td>
+    <td><input type="number" name="display_order" form="dept-form-{{ d.id }}" value="{{ d.display_order }}" style="width:70px"></td>
+    <td>
+      <label><input type="checkbox" name="is_active" form="dept-form-{{ d.id }}" value="true" {% if d.is_active %}checked{% endif %}> активен</label>
+    </td>
+    <td>
+      <button type="submit" form="dept-form-{{ d.id }}">Сохранить</button>
+      <button type="submit" form="dept-delete-form-{{ d.id }}" class="btn-danger"
+              onclick="return confirm('Удалить отдел «{{ d.name }}»? Если к нему привязаны пользователи/задания — потребуется переназначение.')">Удалить</button>
+      <select name="reassign_to" form="dept-delete-form-{{ d.id }}" style="width:130px">
+        <option value="">переназначить в...</option>
+        {% for other in departments if other.id != d.id %}
+        <option value="{{ other.id }}">{{ other.name }}</option>
+        {% endfor %}
+      </select>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="empty-state">Отделов пока нет</td></tr>
+  {% endfor %}
+</table>
+
+{% for d in departments %}
+<form id="dept-form-{{ d.id }}" method="post" action="/admin/departments/{{ d.id }}/update">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+</form>
+<form id="dept-delete-form-{{ d.id }}" method="post" action="/admin/departments/{{ d.id }}/delete">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+</form>
+{% endfor %}
+
+<h2>Новый отдел</h2>
+<form class="filters" method="post" action="/admin/departments/create">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div><label>Название</label><input type="text" name="name" required></div>
+  <div><label>Cost center</label><input type="text" name="cost_center_code"></div>
+  <div><label>Описание</label><input type="text" name="description"></div>
+  <div><label>Порядок отображения</label><input type="number" name="display_order" value="0" style="width:80px"></div>
+  <button type="submit">Создать</button>
+</form>
+{% endblock %}

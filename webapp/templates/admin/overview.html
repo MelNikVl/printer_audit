@@ -1,0 +1,98 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Обзор администрирования</h1>
+
+<div class="cards">
+  <div class="card">
+    <div class="value">{{ "Настроен" if ad_configured else "Не настроен" }}</div>
+    <div class="label">Подключение к AD{% if ad_server %} ({{ ad_server }}){% endif %}</div>
+  </div>
+  <div class="card">
+    <div class="value">{{ ad_user_count }}</div>
+    <div class="label">Пользователей AD в кэше</div>
+  </div>
+  <div class="card">
+    <div class="value">{{ ad_group_count }}</div>
+    <div class="label">Групп AD импортировано</div>
+  </div>
+  <div class="card">
+    <div class="value">{{ department_count }}</div>
+    <div class="label">Активных отделов</div>
+  </div>
+  <div class="card">
+    <div class="value">{{ printer_queue_count }}</div>
+    <div class="label">Активных очередей печати</div>
+  </div>
+  {% if printer_queue_missing_count %}
+  <div class="card">
+    <div class="value">{{ printer_queue_missing_count }}</div>
+    <div class="label">Исчезнувших очередей</div>
+  </div>
+  {% endif %}
+</div>
+
+<div class="two-col">
+  <div>
+    <h2>Последняя синхронизация AD</h2>
+    <table>
+      {% if last_ad_sync %}
+      <tr><th>Когда</th><td>{{ last_ad_sync.started_at }}</td></tr>
+      <tr><th>Статус</th><td>{{ last_ad_sync.status }}</td></tr>
+      <tr><th>Обновлено/ошибок</th><td>{{ last_ad_sync.inserted }} / {{ last_ad_sync.skipped }}</td></tr>
+      {% else %}
+      <tr><td>Синхронизация AD ещё не запускалась</td></tr>
+      {% endif %}
+    </table>
+
+    <h2>Последнее обнаружение принтеров</h2>
+    <table>
+      {% if last_printer_sync %}
+      <tr><th>Когда</th><td>{{ last_printer_sync.started_at }}</td></tr>
+      <tr><th>Статус</th><td>{{ last_printer_sync.status }}</td></tr>
+      <tr><th>Найдено/новых/пропало</th><td>{{ last_printer_sync.events_fetched }} / {{ last_printer_sync.inserted }} / {{ last_printer_sync.skipped }}</td></tr>
+      {% else %}
+      <tr><td>«Обнаружить очереди» ещё не запускалось (см. /admin/printers)</td></tr>
+      {% endif %}
+    </table>
+  </div>
+
+  <div>
+    <h2>Последний запуск сборщика</h2>
+    <table>
+      {% if last_collector_run %}
+      <tr><th>Когда</th><td>{{ last_collector_run.started_at }}</td></tr>
+      <tr><th>Статус</th><td>{{ last_collector_run.status }}</td></tr>
+      <tr><th>Получено</th><td>{{ last_collector_run.events_fetched }}</td></tr>
+      <tr><th>Вставлено</th><td>{{ last_collector_run.inserted }}</td></tr>
+      <tr><th>Пропущено</th><td>{{ last_collector_run.skipped }}</td></tr>
+      <tr><th>Дублей</th><td>{{ last_collector_run.duplicates }}</td></tr>
+      {% if last_collector_run.error_message %}
+      <tr><th>Ошибка</th><td>{{ last_collector_run.error_message }}</td></tr>
+      {% endif %}
+      {% else %}
+      <tr><td>Сборщик ещё не запускался</td></tr>
+      {% endif %}
+    </table>
+
+    <h2>Курсор сборщика (EventRecordID)</h2>
+    <table>
+      <tr><th>Площадка</th><th>Последний RecordId</th><th>Последний запуск</th></tr>
+      {% for s in collector_states %}
+      <tr><td>{{ s.site_code }}</td><td>{{ s.last_record_id }}</td><td>{{ s.last_run_at }}</td></tr>
+      {% else %}
+      <tr><td colspan="3">Нет данных</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+
+{% if recent_failed_runs %}
+<h2>Последние ошибки (все типы запусков)</h2>
+<table>
+  <tr><th>Тип</th><th>Когда</th><th>Ошибка</th></tr>
+  {% for run in recent_failed_runs %}
+  <tr><td>{{ run.run_type }}</td><td>{{ run.started_at }}</td><td>{{ run.error_message }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+{% endblock %}

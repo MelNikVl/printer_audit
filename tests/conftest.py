@@ -141,3 +141,47 @@ def db_env(tmp_path, monkeypatch):
     yield database, db_path
     database.engine.dispose()
     _reset_app_modules()
+
+
+@pytest.fixture
+def http_client(app_env):
+    """TestClient для webapp.main.app, привязанный к той же изолированной БД,
+    что app_env (webapp.* импортируется свежим ПОСЛЕ app_env, поэтому видит
+    правильный printaudit.database). Использовать `login_as()` ниже, чтобы
+    получить залогиненную сессию без реального AD."""
+    from fastapi.testclient import TestClient
+
+    import webapp.main as main
+
+    with TestClient(main.app) as client:
+        yield client
+
+
+def login_as(http_client, role="viewer", login="domain\\testuser", is_active=True):
+    """Создаёт AppUser с указанной ролью и заводит ему реальную серверную
+    сессию (как после успешного входа), выставляя cookie на http_client —
+    без обращения к AD, ровно так, как это делают ролевые/CSRF-тесты, которым
+    не нужно перепроверять сам механизм входа (для него есть отдельные тесты
+    в tests/test_ad_client.py и tests/test_login_flow.py)."""
+    import webapp.main as main  # тот же модуль, что использует http_client
+    from printaudit.database import SessionLocal
+    from printaudit.models import AppUser
+    from printaudit.security.sessions import SESSION_COOKIE_NAME, create_session
+
+    session = SessionLocal()
+    try:
+        user = session.query(AppUser).filter_by(login_normalized=login).first()
+        if user is None:
+            user = AppUser(login_normalized=login, role=role, is_active=is_active)
+            session.add(user)
+        else:
+            user.role = role
+            user.is_active = is_active
+        session.commit()
+        token = create_session(session, user)
+        user_id = user.id
+    finally:
+        session.close()
+
+    http_client.cookies.set(SESSION_COOKIE_NAME, token)
+    return user_id

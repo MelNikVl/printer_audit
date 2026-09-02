@@ -1,0 +1,29 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Правила отделов — предпросмотр (dry-run)</h1>
+<p>Здесь показано, что изменится, если применить текущие правила «AD-группа → отдел»
+(<a href="/admin/ad-groups">задаются здесь</a>). Ничего не применяется автоматически —
+ручные назначения отдела (locked) в этот список не попадают и не меняются.</p>
+
+<table>
+  <tr><th>Пользователь</th><th>Текущий отдел</th><th>Новый отдел</th><th>Источник</th><th>Конфликт приоритетов</th></tr>
+  {% for c in changes %}
+  <tr>
+    <td>{{ c.display_name or c.login_normalized }}</td>
+    <td>{{ departments.get(c.old_department_id, "—") }}</td>
+    <td>{{ departments.get(c.new_department_id, "—") }}</td>
+    <td>{{ c.source }}</td>
+    <td>{% if c.has_conflict %}<span class="badge badge-missing">да — несколько правил с равным приоритетом на разные отделы</span>{% else %}—{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="empty-state">Изменений нет — все пользователи уже в нужных отделах (или отделы назначены вручную/locked)</td></tr>
+  {% endfor %}
+</table>
+
+{% if changes %}
+<form method="post" action="/admin/department-rules/apply" onsubmit="return confirm('Применить синхронизацию? Отделы {{ changes|length }} пользователей будут изменены.')">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">Применить синхронизацию ({{ changes|length }} изменений)</button>
+</form>
+{% endif %}
+{% endblock %}
