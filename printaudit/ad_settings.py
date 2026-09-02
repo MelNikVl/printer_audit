@@ -132,3 +132,27 @@ def get_session_settings() -> SessionSettings:
         lifetime_minutes=_env_int("SESSION_LIFETIME_MINUTES", 480),
         cookie_secure=_env_bool("SESSION_COOKIE_SECURE", False),
     )
+
+
+@dataclass
+class AuthAvailability:
+    local_enabled: bool
+    ad_enabled: bool  # AD_AUTH_ENABLED=true И AD реально настроен (ADSettings.is_configured)
+
+
+def get_auth_availability() -> AuthAvailability:
+    """Единая точка правды "каким провайдером вообще можно входить сейчас".
+
+    LOCAL_AUTH_ENABLED по умолчанию true (иначе можно случайно заблокировать
+    себе вход, отключив AD без единого рабочего локального superadmin).
+    AD_AUTH_ENABLED тоже по умолчанию true — так апгрейд уже развёрнутого
+    сервера, где AD уже настроен и использовался, не отключает его молча;
+    но реально AD доступен, только если он ЕЩЁ И настроен (AD_SERVER/
+    AD_BASE_DN заданы) — задать один только флаг без остальных переменных
+    недостаточно. При ad_enabled=False код НЕ должен обращаться к LDAP вообще
+    (см. webapp/auth_routes.py, webapp/admin_routes.py — все места, где
+    вызывается ADClient, сначала проверяют этот флаг)."""
+    local_enabled = _env_bool("LOCAL_AUTH_ENABLED", True)
+    ad_auth_flag = _env_bool("AD_AUTH_ENABLED", True)
+    ad_settings = get_ad_settings()
+    return AuthAvailability(local_enabled=local_enabled, ad_enabled=ad_auth_flag and ad_settings.is_configured)

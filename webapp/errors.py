@@ -17,6 +17,12 @@ class Forbidden(Exception):
         self.message = message
 
 
+class MustChangePassword(Exception):
+    """Локальная учётка вошла с временным/просроченным паролем
+    (AppUser.must_change_password=True) -- разрешено попасть только на
+    /change-password и /logout, всё остальное перенаправляет туда же."""
+
+
 def safe_error_message(exc: Exception, context: str) -> str:
     """Логирует ПОЛНОЕ исключение (со стектрейсом) с коротким correlation ID
     и возвращает НЕЙТРАЛЬНОЕ сообщение для показа в UI -- без текста самого

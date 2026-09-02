@@ -9,12 +9,23 @@ from fastapi import Depends, Request
 from sqlalchemy.orm import Session
 
 from printaudit.ad.client import ADClient
-from printaudit.ad_settings import get_ad_settings
+from printaudit.ad_settings import AuthAvailability, get_ad_settings, get_auth_availability
 from printaudit.database import SessionLocal
 from printaudit.models import AppUser
 from printaudit.security.csrf import CSRF_COOKIE_NAME, CSRF_FORM_FIELD, CSRF_HEADER_NAME, csrf_tokens_match
 from printaudit.security.sessions import SESSION_COOKIE_NAME, get_app_user_for_token
-from webapp.errors import Forbidden, NotAuthenticated
+from webapp.errors import Forbidden, MustChangePassword, NotAuthenticated
+
+# Пути, куда require_login пропускает пользователя даже с must_change_password=True.
+_CHANGE_PASSWORD_ALLOWED_PATHS = {"/change-password", "/logout"}
+
+
+def get_auth_availability_dep() -> AuthAvailability:
+    """FastAPI-зависимость поверх printaudit.ad_settings.get_auth_availability() —
+    отдельная функция (не голое использование get_auth_availability() в
+    роуте), чтобы тесты могли подменить её через app.dependency_overrides,
+    не трогая переменные окружения процесса."""
+    return get_auth_availability()
 
 
 def get_ad_client() -> ADClient:
@@ -94,6 +105,8 @@ def require_login(
         raise NotAuthenticated(next_path=request.url.path)
     if not user.is_active:
         raise Forbidden("Ваш доступ отключён администратором. Обратитесь к администратору системы.")
+    if user.must_change_password and request.url.path not in _CHANGE_PASSWORD_ALLOWED_PATHS:
+        raise MustChangePassword()
     request.state.app_user = user
     return user
 

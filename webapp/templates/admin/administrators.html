@@ -5,15 +5,19 @@
 
 <h2>Текущие назначения</h2>
 <table>
-  <tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Статус</th><th>Назначил</th><th>Когда</th><th></th></tr>
+  <tr><th>Логин</th><th>Имя</th><th>Провайдер</th><th>Роль</th><th>Статус</th><th>Назначил</th><th>Когда</th><th></th></tr>
   {% for a in admins %}
   <tr>
     <td>{{ a.login_normalized }}</td>
     <td>{{ a.display_name or "" }}</td>
+    <td>{{ "локальный" if a.auth_provider == "local" else "AD" }}</td>
     <td><span class="badge badge-{{ a.role }}">{{ a.role }}</span></td>
     <td>
       {% if a.is_active %}<span class="badge badge-active">активен</span>
       {% else %}<span class="badge badge-inactive">отключён</span>{% endif %}
+      {% if a.auth_provider == "local" and a.must_change_password %}
+      <span class="badge badge-inactive">временный пароль</span>
+      {% endif %}
     </td>
     <td>{{ a.assigned_by_id or "" }}</td>
     <td>{{ a.assigned_at }}</td>
@@ -35,11 +39,31 @@
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="7" class="empty-state">Пока нет ни одного администратора кроме вас</td></tr>
+  <tr><td colspan="8" class="empty-state">Пока нет ни одного администратора кроме вас</td></tr>
   {% endfor %}
 </table>
 
-<h2>Назначить роль по логину напрямую</h2>
+<h2>Создать локального пользователя</h2>
+<p style="font-size:13px; color:#6b7280;">
+  Не требует AD. Пользователю будет выдан случайный временный пароль (покажется один раз
+  сразу после создания) — он обязан сменить его при первом входе.
+</p>
+<form class="filters" method="post" action="/admin/administrators/create-local">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div><label>Логин</label><input type="text" name="login" required></div>
+  <div><label>Имя</label><input type="text" name="display_name"></div>
+  <div><label>Email</label><input type="email" name="email"></div>
+  <div><label>Роль</label>
+    <select name="role">
+      <option value="viewer">viewer</option>
+      <option value="admin">admin</option>
+      {% if current_user.role == "superadmin" %}<option value="superadmin">superadmin</option>{% endif %}
+    </select>
+  </div>
+  <button type="submit">Создать</button>
+</form>
+
+<h2>Назначить роль напрямую по логину (без пароля, для AD-учёток)</h2>
 <form class="filters" method="post" action="/admin/administrators/assign">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <div><label>Логин (DOMAIN\login)</label><input type="text" name="login" required></div>
@@ -52,6 +76,9 @@
 </form>
 
 <h2>Найти пользователя в AD</h2>
+{% if not auth.ad_enabled %}
+<div class="empty-state">AD отключён — поиск и импорт из Active Directory недоступны. Используйте создание локального пользователя выше.</div>
+{% else %}
 <form class="filters" method="get" action="/admin/administrators">
   <div><label>Поиск (логин, имя, email)</label><input type="text" name="q" value="{{ q }}"></div>
   <button type="submit">Искать в AD</button>
@@ -89,5 +116,6 @@
 </table>
 {% elif q %}
 <div class="empty-state">В AD ничего не найдено по запросу «{{ q }}»</div>
+{% endif %}
 {% endif %}
 {% endblock %}

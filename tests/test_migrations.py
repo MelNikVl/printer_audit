@@ -162,6 +162,40 @@ def test_migrate_preexisting_mvp_database_preserves_print_jobs(db_env):
         conn.close()
 
 
+def test_migrate_existing_app_users_backfills_local_auth_columns(db_env):
+    """Регрессия для миграции 1eba877fed63: обновление сервера, где уже есть
+    app_users (созданные до появления local-провайдера, все через AD), не
+    должно терять ни одной строки и должно проставить безопасные значения по
+    умолчанию (auth_provider='ad', остальное NULL/0/False) без ручного
+    вмешательства."""
+    database, db_path = db_env
+
+    # Накатываем ровно ДО новой миграции, создаём app_users вручную (как они
+    # выглядели БЕЗ полей local-auth), затем догоняем до head.
+    cfg = _alembic_config()
+    command.upgrade(cfg, "4980b40c3753")
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO app_users (login_normalized, role, is_active, assigned_at, created_at, updated_at) "
+        "VALUES ('domain\\ivanov', 'superadmin', 1, '2026-08-01T10:00:00', '2026-08-01T10:00:00', '2026-08-01T10:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT login_normalized, role, auth_provider, password_hash, must_change_password, "
+            "failed_login_count, locked_until FROM app_users WHERE login_normalized = 'domain\\ivanov'"
+        ).fetchone()
+        assert row == ("domain\\ivanov", "superadmin", "ad", None, 0, 0, None)
+    finally:
+        conn.close()
+
+
 def test_migrate_preexisting_database_is_idempotent(db_env):
     """Повторный `alembic upgrade head` на уже смигрированной БД не должен
     падать (например, из-за попытки создать таблицу, которая уже есть)."""

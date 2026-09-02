@@ -74,9 +74,10 @@ data/, logs/            БД и логи (создаются автоматич�
 
 ## Развёртывание на одном объекте (с нуля)
 
-Предполагается Windows Server 2016/2019/2022 с ролью Print Server, доступом
-в домен AD и Python 3.10+ ([python.org](https://www.python.org/downloads/windows/),
-при установке отметить "Add python.exe to PATH").
+Предполагается Windows Server 2016/2019/2022 с ролью Print Server и Python
+3.10+ ([python.org](https://www.python.org/downloads/windows/), при установке
+отметить "Add python.exe to PATH"). Домен AD — **опционален**: можно
+развернуть только на локальных учётках, без AD вообще (см. ниже).
 
 ```powershell
 cd C:\path\to\print-audit
@@ -88,7 +89,7 @@ copy config\config.example.yaml config\config.yaml
 notepad config\config.yaml         # site_code, при желании БД/тарифы по умолчанию
 
 copy .env.example .env
-notepad .env                       # AD_SERVER/AD_BASE_DN/AD_BIND_USER/... + SESSION_SECRET_KEY
+notepad .env                       # LOCAL_AUTH_ENABLED/AD_AUTH_ENABLED + SESSION_SECRET_KEY (+ AD_* если нужен AD)
 
 python scripts\init_db.py          # применяет миграции Alembic + сидит price_list
 ```
@@ -99,16 +100,24 @@ python scripts\init_db.py          # применяет миграции Alembic
 python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Выдать доступ первому superadmin (по логину AD — см.
+Выдать доступ первому superadmin — локально (без AD, пароль вводится
+интерактивно, не аргументом командной строки):
+
+```powershell
+python scripts\bootstrap_local_superadmin.py --login localadmin
+```
+
+...либо по логину AD, если AD настроен (см.
 [docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md), раздел «Bootstrap первого superadmin»):
 
 ```powershell
 python scripts\bootstrap_superadmin.py --login "DOMAIN\ivanov"
 ```
 
-Включить журнал печати и откалибровать разбор полей событий 307 — по
-[docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md), разделы про калибровку. Это
-обязательный шаг: без калибровки `field_map` отчёты будут содержать мусор.
+Если печать нужно учитывать по Windows Print Server events (обычный сценарий
+этого проекта) — включите журнал печати и откалибруйте разбор полей событий
+307 по [docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md), разделы про калибровку.
+Это обязательный шаг: без калибровки `field_map` отчёты будут содержать мусор.
 
 Зарегистрировать сборщик в Task Scheduler (каждые 2 минуты по умолчанию,
 использует Python из `.venv`, проверяет интерпретатор перед регистрацией):

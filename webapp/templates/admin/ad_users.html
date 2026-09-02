@@ -2,10 +2,17 @@
 {% block admin_content %}
 <h1>Пользователи AD</h1>
 
+{% if not auth.ad_enabled %}
+<div class="empty-state">
+  AD отключён администратором (или не настроен). Поиск, импорт и синхронизация недоступны.
+  Уже импортированные ранее пользователи ниже видны и редактируемы как обычно.
+</div>
+{% else %}
 <form class="filters" method="post" action="/admin/ad-users/resync" onsubmit="return confirm('Обновить данные всех импортированных пользователей из AD?')">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <button type="submit">Повторная синхронизация всех импортированных</button>
 </form>
+{% endif %}
 
 <table>
   <tr><th>Логин</th><th>Имя</th><th>Email</th><th>SID/GUID</th><th>Отдел</th><th>Locked</th><th>Статус</th><th></th></tr>
@@ -52,6 +59,7 @@
   {% endfor %}
 </table>
 
+{% if auth.ad_enabled %}
 <h2>Найти и импортировать пользователя из AD</h2>
 <form class="filters" method="get" action="/admin/ad-users">
   <div><label>Поиск (логин, имя, email)</label><input type="text" name="q" value="{{ q }}"></div>
@@ -92,5 +100,6 @@
 </table>
 {% elif q %}
 <div class="empty-state">В AD ничего не найдено по запросу «{{ q }}»</div>
+{% endif %}
 {% endif %}
 {% endblock %}

@@ -19,6 +19,9 @@
   {% endif %}
   <span class="nav-spacer"></span>
   {% if current_user %}
+  {% if current_user.auth_provider == "local" %}
+  <a href="/change-password">Сменить пароль</a>
+  {% endif %}
   <span class="nav-user">{{ current_user.display_name or current_user.login_normalized }} ({{ current_user.role }})</span>
   <form method="post" action="/logout" class="nav-logout-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

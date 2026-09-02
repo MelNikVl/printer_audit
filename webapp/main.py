@@ -32,7 +32,7 @@ from printaudit.config import get_settings  # noqa: E402
 from printaudit.models import AppUser  # noqa: E402
 from webapp import admin_routes, auth_routes  # noqa: E402
 from webapp.deps import csrf_token, get_db, require_login  # noqa: E402
-from webapp.errors import Forbidden, NotAuthenticated  # noqa: E402
+from webapp.errors import Forbidden, MustChangePassword, NotAuthenticated  # noqa: E402
 from webapp.middleware import CsrfCookieMiddleware  # noqa: E402
 from webapp.templating import BASE_DIR, templates  # noqa: E402
 
@@ -68,6 +68,13 @@ async def _not_authenticated_handler(request: Request, exc: NotAuthenticated):
     if _is_api_path(request.url.path):
         return JSONResponse(status_code=401, content={"detail": "Требуется вход в систему"})
     return RedirectResponse(url=f"/login?next={exc.next_path}", status_code=303)
+
+
+@app.exception_handler(MustChangePassword)
+async def _must_change_password_handler(request: Request, exc: MustChangePassword):
+    if _is_api_path(request.url.path):
+        return JSONResponse(status_code=403, content={"detail": "Требуется смена пароля"})
+    return RedirectResponse(url="/change-password", status_code=303)
 
 
 @app.exception_handler(Forbidden)

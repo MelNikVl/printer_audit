@@ -37,6 +37,12 @@
   {% endfor %}
 </table>
 
+{% if not auth.ad_enabled %}
+<div class="empty-state">
+  AD отключён администратором (или не настроен). Поиск и импорт групп недоступны.
+  Уже импортированные группы выше видны и редактируемы, но синхронизация участников не работает.
+</div>
+{% else %}
 <h2>Найти и импортировать группу из AD</h2>
 <form class="filters" method="get" action="/admin/ad-groups">
   <div><label>Поиск</label><input type="text" name="q" value="{{ q }}"></div>
@@ -73,5 +79,6 @@
 </table>
 {% elif q %}
 <div class="empty-state">В AD ничего не найдено по запросу «{{ q }}»</div>
+{% endif %}
 {% endif %}
 {% endblock %}
