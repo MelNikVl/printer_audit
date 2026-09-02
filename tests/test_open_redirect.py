@@ -72,9 +72,10 @@ class _FakeADClient:
 
 def _setup_app_user_and_override(http_client):
     import webapp.main as main
+    from printaudit.ad_settings import AuthAvailability
     from printaudit.database import SessionLocal
     from printaudit.models import AppUser
-    from webapp.deps import get_ad_client
+    from webapp.deps import get_ad_client, get_auth_availability_dep
 
     session = SessionLocal()
     session.add(AppUser(login_normalized="example.local\\ivanov", role="viewer", is_active=True))
@@ -82,6 +83,12 @@ def _setup_app_user_and_override(http_client):
     session.close()
 
     main.app.dependency_overrides[get_ad_client] = lambda: _FakeADClient()
+    # Тестовое окружение не настраивает AD_SERVER/AD_BASE_DN -- форсируем
+    # ad_enabled=True явно, эти тесты про open redirect, а не про то, включён
+    # ли AD (см. tests/test_local_login_http.py для этого).
+    main.app.dependency_overrides[get_auth_availability_dep] = lambda: AuthAvailability(
+        local_enabled=True, ad_enabled=True
+    )
 
 
 def _login(http_client, next_value):
@@ -89,7 +96,7 @@ def _login(http_client, next_value):
     csrf = http_client.cookies.get("pa_csrf")
     return http_client.post(
         "/login",
-        data={"csrf_token": csrf, "login": "ivanov", "password": "CorrectPass1", "next": next_value},
+        data={"csrf_token": csrf, "login": "ivanov", "password": "CorrectPass1", "provider": "ad", "next": next_value},
         follow_redirects=False,
     )
 

@@ -43,9 +43,17 @@ class _FakeADClient:
 
 def _override_ad_client(http_client, fake_client):
     import webapp.main as main
-    from webapp.deps import get_ad_client
+    from printaudit.ad_settings import AuthAvailability
+    from webapp.deps import get_ad_client, get_auth_availability_dep
 
     main.app.dependency_overrides[get_ad_client] = lambda: fake_client
+    # Тестовое окружение не задаёт AD_SERVER/AD_BASE_DN (ADSettings.is_configured
+    # был бы False), поэтому явно форсируем ad_enabled=True -- эти тесты про сам
+    # AD-флоу, а не про то, включён ли AD в принципе (для этого см.
+    # tests/test_local_login_http.py).
+    main.app.dependency_overrides[get_auth_availability_dep] = lambda: AuthAvailability(
+        local_enabled=True, ad_enabled=True
+    )
 
 
 def _get_csrf(http_client):
@@ -63,7 +71,7 @@ def test_login_with_correct_ad_credentials_but_no_app_user_is_refused(http_clien
     _override_ad_client(http_client, _FakeADClient())
     csrf = _get_csrf(http_client)
     resp = http_client.post(
-        "/login", data={"csrf_token": csrf, "login": "ivanov", "password": "CorrectPass1", "next": "/"}
+        "/login", data={"csrf_token": csrf, "login": "ivanov", "password": "CorrectPass1", "provider": "ad", "next": "/"}
     )
     assert resp.status_code == 403
     assert "доступ" in resp.text.lower()
@@ -73,7 +81,7 @@ def test_login_with_wrong_password_is_401(http_client):
     _override_ad_client(http_client, _FakeADClient())
     csrf = _get_csrf(http_client)
     resp = http_client.post(
-        "/login", data={"csrf_token": csrf, "login": "ivanov", "password": "WrongPassword", "next": "/"}
+        "/login", data={"csrf_token": csrf, "login": "ivanov", "password": "WrongPassword", "provider": "ad", "next": "/"}
     )
     assert resp.status_code == 401
     assert "wrongpassword" not in resp.text.lower()  # пароль не должен светиться в ответе
@@ -93,7 +101,7 @@ def test_login_succeeds_and_sets_session_cookie_when_app_user_exists(http_client
     csrf = _get_csrf(http_client)
     resp = http_client.post(
         "/login",
-        data={"csrf_token": csrf, "login": "ivanov", "password": "CorrectPass1", "next": "/"},
+        data={"csrf_token": csrf, "login": "ivanov", "password": "CorrectPass1", "provider": "ad", "next": "/"},
         follow_redirects=False,
     )
     assert resp.status_code == 303
@@ -118,7 +126,7 @@ def test_login_normalizes_all_three_formats_to_same_app_user(http_client):
         csrf = _get_csrf(client_module_client)
         resp = client_module_client.post(
             "/login",
-            data={"csrf_token": csrf, "login": login_variant, "password": "CorrectPass1", "next": "/"},
+            data={"csrf_token": csrf, "login": login_variant, "password": "CorrectPass1", "provider": "ad", "next": "/"},
             follow_redirects=False,
         )
         assert resp.status_code == 303, f"login variant failed: {login_variant}"
