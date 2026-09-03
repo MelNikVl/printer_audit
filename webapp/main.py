@@ -30,7 +30,7 @@ from printaudit import queries  # noqa: E402
 from printaudit.ad_settings import validate_session_secret  # noqa: E402
 from printaudit.config import get_settings  # noqa: E402
 from printaudit.models import AppUser, Department, PrintJob, PrintServer, Site  # noqa: E402
-from webapp import admin_routes, auth_routes  # noqa: E402
+from webapp import admin_routes, agent_api, auth_routes  # noqa: E402
 from webapp.deps import csrf_token, get_db, require_login  # noqa: E402
 from webapp.errors import Forbidden, MustChangePassword, NotAuthenticated  # noqa: E402
 from webapp.middleware import CsrfCookieMiddleware  # noqa: E402
@@ -57,6 +57,7 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 
 app.include_router(auth_routes.router)
 app.include_router(admin_routes.router)
+app.include_router(agent_api.router)
 
 
 def _is_api_path(path: str) -> bool:
