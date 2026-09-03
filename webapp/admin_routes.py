@@ -1091,8 +1091,9 @@ def admin_endpoint_agents_create(
     return _redirect(
         "/admin/endpoint-agents",
         msg=(
-            f"Endpoint-агент «{hostname}» зарегистрирован. Токен (показывается один раз, "
-            f"скопируйте в .env агента): {raw_token}"
+            f"Endpoint-агент «{hostname}» зарегистрирован. ENDPOINT_UUID={agent.uuid} "
+            f"ENDPOINT_TOKEN={raw_token} (токен показывается один раз — скопируйте обе строки "
+            f"в endpoint_agent.env на этом ПК)."
         ),
     )
 

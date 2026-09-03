@@ -1,0 +1,6 @@
+# Единственная сторонняя зависимость endpoint-агента — pywin32, нужен
+# только для endpoint_agent/service.py (обёртка Windows Service и чтение
+# журнала событий через win32evtlog/servicemanager). Остальной пакет
+# (config/ports/capture/outbox/sync_client/runner) — чистый stdlib и
+# работает/тестируется без pywin32 (см. endpoint_agent/__init__.py).
+pywin32==306
