@@ -142,7 +142,14 @@ def test_agent_sync_duplicate_ack_also_marks_delivered(app_env, monkeypatch):
         session.close()
 
 
-def test_agent_sync_rejected_ack_keeps_retrying_with_backoff(app_env, monkeypatch):
+def test_agent_sync_rejected_ack_is_terminal_and_never_auto_retried(app_env, monkeypatch):
+    """pre-merge hardening: ack "rejected" — центр ЯВНО сказал "это
+    невалидные данные", это НЕ временный сбой. Раньше такая строка
+    получала status="failed" НО при этом всё равно получала
+    next_attempt_at и продолжала попадать в следующую выборку — то есть
+    бесконечно повторялась, что было ошибкой. Теперь она терминальна:
+    next_attempt_at сбрасывается в None и _fetch_due_outbox_rows() больше
+    никогда её не вернёт (пока не будет явного ручного --retry-failed)."""
     _enable_agent_mode(monkeypatch)
     import collector.agent_sync as agent_sync
     import collector.collect_print_events as cpe
@@ -169,9 +176,175 @@ def test_agent_sync_rejected_ack_keeps_retrying_with_backoff(app_env, monkeypatc
         assert outbox.status == "failed"
         assert outbox.attempts == 1
         assert "department not found" in outbox.last_error
-        assert outbox.next_attempt_at is not None
+        assert outbox.next_attempt_at is None  # терминально, не запланирован повтор
+
+        # Ключевая проверка: следующая выборка "что отправлять" эту строку
+        # больше не видит вообще, даже если send_batch снова замокан на успех.
+        due = agent_sync._fetch_due_outbox_rows(session, limit=100)
+        assert due == []
     finally:
         session.close()
+
+    # И даже повторный run_once() ничего не отправляет — send_batch не должен
+    # быть вызван вовсе, раз выбирать нечего.
+    calls = []
+    monkeypatch.setattr(
+        agent_sync, "send_batch",
+        lambda *a, **k: calls.append(1) or {"accepted": 0, "duplicates": 0, "rejected": 0, "results": []},
+    )
+    agent_sync.run_once()
+    assert calls == []
+
+
+def test_agent_sync_missing_ack_for_specific_record_stays_pending_and_retries(app_env, monkeypatch):
+    """Центр вернул 200, но забыл этот конкретный record_id в results —
+    это protocol-нарушение центра, не признак невалидности события: должно
+    остаться pending (retryable), с backoff, как при сетевом сбое, а не
+    стать терминальным failed."""
+    _enable_agent_mode(monkeypatch)
+    import collector.agent_sync as agent_sync
+    import collector.collect_print_events as cpe
+
+    _patch_subprocess(monkeypatch, cpe, stdout=json.dumps(_one_event(record_id=11)))
+    cpe.run_once()
+
+    monkeypatch.setattr(
+        agent_sync, "send_batch",
+        lambda client, base_url, token, timeout, payload: {
+            "accepted": 0, "duplicates": 0, "rejected": 0, "results": [],  # нет ack для record_id=11
+        },
+    )
+    monkeypatch.setattr(agent_sync, "send_heartbeat", lambda *a, **k: {"ok": True, "server_status": "online"})
+    agent_sync.run_once()
+
+    from printaudit.database import SessionLocal
+    from printaudit.models import OutboxEvent
+
+    session = SessionLocal()
+    try:
+        outbox = session.query(OutboxEvent).one()
+        assert outbox.status == "pending"
+        assert outbox.attempts == 1
+        assert outbox.next_attempt_at is not None
+        assert "подтверждение" in outbox.last_error
+    finally:
+        session.close()
+
+
+def test_retry_failed_rows_resets_terminal_failed_back_to_pending(app_env, monkeypatch):
+    from printaudit.database import SessionLocal
+    from printaudit.models import OutboxEvent
+
+    _enable_agent_mode(monkeypatch)
+    import collector.agent_sync as agent_sync
+    import collector.collect_print_events as cpe
+
+    _patch_subprocess(monkeypatch, cpe, stdout=json.dumps(_one_event(record_id=21)))
+    cpe.run_once()
+
+    session = SessionLocal()
+    outbox = session.query(OutboxEvent).one()
+    outbox.status = "failed"
+    outbox.attempts = 3
+    outbox.last_error = "department not found"
+    outbox.next_attempt_at = None
+    session.commit()
+    session.close()
+
+    session = SessionLocal()
+    try:
+        reset_count = agent_sync.retry_failed_rows(session)
+        assert reset_count == 1
+        row = session.query(OutboxEvent).one()
+        assert row.status == "pending"
+        assert row.attempts == 0
+        assert row.last_error is None
+    finally:
+        session.close()
+
+    # Идемпотентность: без failed-строк — no-op.
+    session = SessionLocal()
+    try:
+        assert agent_sync.retry_failed_rows(session) == 0
+    finally:
+        session.close()
+
+
+def test_cli_retry_failed_flag_resets_and_immediately_resends_in_same_run(app_env, monkeypatch):
+    _enable_agent_mode(monkeypatch)
+    import collector.agent_sync as agent_sync
+    import collector.collect_print_events as cpe
+
+    _patch_subprocess(monkeypatch, cpe, stdout=json.dumps(_one_event(record_id=31)))
+    cpe.run_once()
+
+    from printaudit.database import SessionLocal
+    from printaudit.models import OutboxEvent
+
+    session = SessionLocal()
+    outbox = session.query(OutboxEvent).one()
+    outbox.status = "failed"
+    outbox.attempts = 2
+    outbox.last_error = "было отклонено ранее"
+    outbox.next_attempt_at = None
+    session.commit()
+    session.close()
+
+    monkeypatch.setattr(
+        agent_sync, "send_batch",
+        lambda client, base_url, token, timeout, payload: {
+            "accepted": len(payload["events"]), "duplicates": 0, "rejected": 0,
+            "results": [{"record_id": e["record_id"], "status": "inserted"} for e in payload["events"]],
+        },
+    )
+    monkeypatch.setattr(agent_sync, "send_heartbeat", lambda *a, **k: {"ok": True, "server_status": "online"})
+
+    agent_sync.run_once(retry_failed=True)
+
+    session = SessionLocal()
+    try:
+        row = session.query(OutboxEvent).one()
+        assert row.status == "delivered"
+    finally:
+        session.close()
+
+
+def test_heartbeat_reports_pending_and_failed_queue_sizes_separately(app_env, monkeypatch):
+    _enable_agent_mode(monkeypatch)
+    import collector.agent_sync as agent_sync
+    import collector.collect_print_events as cpe
+
+    _patch_subprocess(monkeypatch, cpe, stdout=json.dumps([_one_event(41), _one_event(42)]))
+    cpe.run_once()
+
+    from printaudit.database import SessionLocal
+    from printaudit.models import OutboxEvent
+
+    session = SessionLocal()
+    rows = session.query(OutboxEvent).order_by(OutboxEvent.id).all()
+    rows[0].status = "failed"
+    rows[0].next_attempt_at = None
+    session.commit()
+    session.close()
+
+    heartbeat_payloads = []
+
+    def _fake_send_batch(client, base_url, token, timeout, payload):
+        # rows[1] всё ещё pending и будет отправлен в этом же запуске -- не
+        # мокаем полный успех, чтобы после run_once один pending остался.
+        return {"accepted": 0, "duplicates": 0, "rejected": 0, "results": []}
+
+    def _fake_send_heartbeat(client, base_url, token, timeout, payload):
+        heartbeat_payloads.append(payload)
+        return {"ok": True, "server_status": "online"}
+
+    monkeypatch.setattr(agent_sync, "send_batch", _fake_send_batch)
+    monkeypatch.setattr(agent_sync, "send_heartbeat", _fake_send_heartbeat)
+    agent_sync.run_once()
+
+    assert len(heartbeat_payloads) == 1
+    assert heartbeat_payloads[0]["pending_queue_size"] == 1
+    assert heartbeat_payloads[0]["failed_queue_size"] == 1
 
 
 def test_agent_sync_network_failure_does_not_mark_delivered_and_schedules_retry(app_env, monkeypatch):

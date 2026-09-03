@@ -90,6 +90,7 @@ def test_duplicate_server_name_on_same_site_rejected(http_client):
 
 def test_rotate_token_invalidates_old_token(http_client, monkeypatch):
     login_as(http_client, role="admin")
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
 
     from printaudit.database import SessionLocal
@@ -131,6 +132,7 @@ def test_rotate_token_invalidates_old_token(http_client, monkeypatch):
 
 def test_disable_and_enable_print_server(http_client, monkeypatch):
     login_as(http_client, role="admin")
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
 
     from printaudit.database import SessionLocal

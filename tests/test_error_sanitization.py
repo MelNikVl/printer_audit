@@ -7,6 +7,66 @@ import logging
 SENSITIVE_DETAIL = "dc01.internal.corp.example:636 refused connection, LDAP result code 52"
 
 
+def test_validation_error_handler_does_not_crash_on_non_json_serializable_error_context(http_client, monkeypatch):
+    """Регрессия: pydantic exc.errors() может нести "input" со значением
+    NaN/Infinity (json.dumps с allow_nan=False у Starlette JSONResponse
+    падает на них) или "ctx" с самим объектом исключения из кастомного
+    @field_validator (никогда не сериализуется) — раньше попытка ответить
+    422 на именно такой невалидный ввод сама падала с 500, вместо того
+    чтобы объяснить клиенту, что не так. Обе причины воспроизведены через
+    /api/v1/agent/events/batch (см. webapp/agent_api.py::_reject_non_finite
+    для ValueError-в-ctx и total_pages для NaN-в-input)."""
+    import json
+
+    from printaudit.database import SessionLocal
+    from printaudit.security.agent_tokens import generate_agent_token, hash_agent_token
+    from printaudit.sites import get_or_create_print_server, get_or_create_site
+    from printaudit.timeutil import utcnow
+
+    monkeypatch.setenv("APP_MODE", "central")
+    monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
+    session = SessionLocal()
+    site = get_or_create_site(session, "ERRTEST", name="ErrTest")
+    server = get_or_create_print_server(session, site, "ERR-1")
+    token = generate_agent_token()
+    server.token_hash = hash_agent_token(token)
+    server.token_created_at = utcnow()
+    session.commit()
+    site_uuid, server_uuid = site.uuid, server.uuid
+    session.close()
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    # 1) ValueError из кастомного field_validator (cost отрицательный).
+    resp = http_client.post(
+        "/api/v1/agent/events/batch",
+        json={
+            "protocol_version": 1, "site_uuid": site_uuid, "print_server_uuid": server_uuid,
+            "generated_at": "2026-09-03T10:00:00+00:00",
+            "events": [{
+                "record_id": 1, "time_created": "2026-09-03T09:00:00+00:00",
+                "user_name": "u", "printer_name": "p", "total_pages": 1, "cost": -5.0,
+            }],
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]
+
+    # 2) NaN в поле числа (не строгий JSON, но json.loads стандартной
+    # библиотеки его допускает как расширение).
+    raw_body = (
+        '{"protocol_version":1,"site_uuid":"' + site_uuid + '","print_server_uuid":"' + server_uuid
+        + '","generated_at":"2026-09-03T10:00:00+00:00","events":['
+        + '{"record_id":1,"time_created":"2026-09-03T09:00:00+00:00","user_name":"u",'
+        + '"printer_name":"p","total_pages":1,"cost":NaN}]}'
+    )
+    json.loads(raw_body)  # подтверждаем, что сам ввод синтаксически валиден для json.loads
+    resp2 = http_client.post("/api/v1/agent/events/batch", content=raw_body, headers=headers)
+    assert resp2.status_code == 422
+    assert resp2.json()["detail"]
+
+
 def test_safe_error_message_hides_detail_and_logs_it(caplog):
     from webapp.errors import safe_error_message
 

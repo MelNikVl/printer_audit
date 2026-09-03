@@ -66,6 +66,7 @@ def _event(record_id, **overrides):
 def test_events_batch_requires_https_when_configured(http_client, monkeypatch):
     from printaudit.database import SessionLocal
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "true")
     session = SessionLocal()
     reg = _register_print_server(session)
@@ -83,6 +84,7 @@ def test_events_batch_requires_https_when_configured(http_client, monkeypatch):
 def test_events_batch_rejects_missing_token(http_client, monkeypatch):
     from printaudit.database import SessionLocal
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg = _register_print_server(session)
@@ -95,6 +97,7 @@ def test_events_batch_rejects_missing_token(http_client, monkeypatch):
 def test_events_batch_rejects_wrong_token(http_client, monkeypatch):
     from printaudit.database import SessionLocal
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg = _register_print_server(session)
@@ -112,6 +115,7 @@ def test_events_batch_rejects_disabled_server_token(http_client, monkeypatch):
     from printaudit.database import SessionLocal
     from printaudit.models import PrintServer
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg = _register_print_server(session)
@@ -134,6 +138,7 @@ def test_events_batch_rejects_rotated_out_token(http_client, monkeypatch):
     from printaudit.models import PrintServer
     from printaudit.security.agent_tokens import generate_agent_token, hash_agent_token
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg = _register_print_server(session)
@@ -160,6 +165,7 @@ def test_events_batch_rejects_rotated_out_token(http_client, monkeypatch):
 def test_events_batch_rejects_identity_mismatch(http_client, monkeypatch):
     from printaudit.database import SessionLocal
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg_a = _register_print_server(session, site_code="SITE-A", server_name="A1")
@@ -179,6 +185,7 @@ def test_events_batch_inserts_and_is_idempotent_within_and_across_batches(http_c
     from printaudit.database import SessionLocal
     from printaudit.models import PrintJob
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg = _register_print_server(session)
@@ -229,6 +236,7 @@ def test_events_batch_same_record_id_on_two_different_servers_both_accepted(http
     from printaudit.database import SessionLocal
     from printaudit.models import PrintJob
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg_a = _register_print_server(session, site_code="SITE-A", server_name="A1")
@@ -262,6 +270,7 @@ def test_events_batch_same_printer_name_on_two_different_servers_both_kept(http_
     from printaudit.database import SessionLocal
     from printaudit.models import PrinterQueue
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg_a = _register_print_server(session, site_code="SITE-A", server_name="A1")
@@ -285,8 +294,14 @@ def test_events_batch_same_printer_name_on_two_different_servers_both_kept(http_
 
 
 def test_events_batch_rejects_invalid_event_without_failing_whole_batch(http_client, monkeypatch):
+    """"Невалидное" здесь -- то, что можно определить только в процессе
+    обработки (per-event, внутри цикла): printer_name из одних пробелов.
+    Структурно некорректные поля (например, отрицательный total_pages)
+    отклоняют ВЕСЬ пакет схемой ещё до обработки — см.
+    test_events_batch_with_structurally_invalid_event_rejects_whole_batch_and_writes_nothing."""
     from printaudit.database import SessionLocal
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg = _register_print_server(session)
@@ -294,7 +309,7 @@ def test_events_batch_rejects_invalid_event_without_failing_whole_batch(http_cli
 
     resp = http_client.post(
         "/api/v1/agent/events/batch",
-        json=_batch_payload(reg, [_event(1, total_pages=-5), _event(2, document_name="ok.pdf")]),
+        json=_batch_payload(reg, [_event(1, printer_name="   "), _event(2, document_name="ok.pdf")]),
         headers={"Authorization": f"Bearer {reg.token}"},
     )
     body = resp.json()
@@ -308,6 +323,7 @@ def test_events_batch_rejects_invalid_event_without_failing_whole_batch(http_cli
 def test_agent_token_never_appears_in_logs_or_responses(http_client, monkeypatch, caplog):
     from printaudit.database import SessionLocal
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg = _register_print_server(session)
@@ -327,6 +343,7 @@ def test_heartbeat_updates_server_and_returns_computed_status(http_client, monke
     from printaudit.database import SessionLocal
     from printaudit.models import PrintServer
 
+    monkeypatch.setenv("APP_MODE", "central")
     monkeypatch.setenv("AGENT_REQUIRE_HTTPS", "false")
     session = SessionLocal()
     reg = _register_print_server(session)
