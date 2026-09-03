@@ -13,16 +13,17 @@
 </div>
 
 <table>
-  <tr><th>Принтер / очередь</th><th>Заданий</th><th>Страниц</th><th>Стоимость ({{ currency }})</th></tr>
+  <tr><th>Принтер / очередь</th><th>Заданий</th><th>Страниц</th><th>Стоимость ({{ currency }})</th><th></th></tr>
   {% for r in rows %}
   <tr>
     <td>{{ r.printer_name }}</td>
     <td>{{ r.jobs }}</td>
     <td>{{ r.pages }}</td>
     <td>{{ "%.2f"|format(r.cost) }}</td>
+    <td><a href="/print-jobs?printer_name={{ r.printer_name | urlencode }}&date_from={{ date_from }}&date_to={{ date_to }}">журнал</a></td>
   </tr>
   {% else %}
-  <tr><td colspan="4">Нет данных за выбранный период</td></tr>
+  <tr><td colspan="5">Нет данных за выбранный период</td></tr>
   {% endfor %}
 </table>
 

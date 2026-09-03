@@ -29,7 +29,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa
 from printaudit import queries  # noqa: E402
 from printaudit.ad_settings import validate_session_secret  # noqa: E402
 from printaudit.config import get_settings  # noqa: E402
-from printaudit.models import AppUser  # noqa: E402
+from printaudit.models import AppUser, Department, PrintJob, PrintServer, Site  # noqa: E402
 from webapp import admin_routes, auth_routes  # noqa: E402
 from webapp.deps import csrf_token, get_db, require_login  # noqa: E402
 from webapp.errors import Forbidden, MustChangePassword, NotAuthenticated  # noqa: E402
@@ -217,6 +217,103 @@ def page_by_printer(
     )
 
 
+MAX_PAGE_SIZE = 200
+DEFAULT_PAGE_SIZE = 50
+
+
+def _pagination(page: Optional[int], page_size: Optional[int]):
+    page = page if page and page > 0 else 1
+    page_size = page_size if page_size and page_size > 0 else DEFAULT_PAGE_SIZE
+    return page, min(page_size, MAX_PAGE_SIZE)
+
+
+def _job_filters(
+    date_from, date_to, department_id, user_name, printer_name,
+    site_id, print_server_id, color, q,
+):
+    d_from, d_to, df, dt = date_filters(date_from, date_to)
+    filters = dict(
+        date_from=d_from, date_to=d_to, department_id=department_id, user_name=user_name,
+        printer_name=printer_name, site_id=site_id, print_server_id=print_server_id,
+        color=color or None, document_search=q or None,
+    )
+    return filters, df, dt
+
+
+def _job_to_dict(j: PrintJob) -> dict:
+    """Единое представление задания для журнала /print-jobs, /api/print-jobs
+    и CSV-экспорта — те же поля везде (см. требование "расширить API и CSV
+    этими же полями")."""
+    return {
+        "id": j.id,
+        "job_id": j.job_id,
+        "time_created": j.time_created.isoformat(),
+        "site_id": j.site_id,
+        "site": j.site.name if j.site else j.site_code,
+        "print_server_id": j.print_server_id,
+        "print_server": (j.print_server.display_name or j.print_server.server_name) if j.print_server else None,
+        "user_name": j.user_name,
+        "department_id": j.department_id,
+        "department": j.department.name if j.department else None,
+        "printer_name": j.printer_name,
+        "document_name": j.document_name,
+        "source_computer": j.source_computer,
+        "total_pages": j.total_pages,
+        "copies": j.copies,
+        "pages_per_copy": j.pages_per_copy,
+        "is_color": j.is_color,
+        "color_source": j.color_source,
+        "price_per_page": j.price_per_page,
+        "currency": j.currency,
+        "cost": j.cost,
+    }
+
+
+@app.get("/print-jobs")
+def page_print_jobs(
+    request: Request,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    department_id: Optional[int] = None,
+    user_name: Optional[str] = None,
+    printer_name: Optional[str] = None,
+    site_id: Optional[int] = None,
+    print_server_id: Optional[int] = None,
+    color: Optional[str] = None,
+    q: Optional[str] = None,
+    page: int = 1,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_login),
+):
+    """Построчный журнал заданий печати (в отличие от агрегированных
+    /by-user, /by-printer) — с серверными фильтрами и серверной пагинацией
+    (вся таблица никогда не грузится в браузер целиком)."""
+    filters, df, dt = _job_filters(
+        date_from, date_to, department_id, user_name, printer_name, site_id, print_server_id, color, q
+    )
+    page, page_size = _pagination(page, page_size)
+    total = queries.count_jobs(db, **filters)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    rows = queries.list_jobs(db, limit=page_size, offset=(page - 1) * page_size, **filters)
+
+    return templates.TemplateResponse(
+        "print_jobs.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "rows": rows, "date_from": df, "date_to": dt,
+            "department_id": department_id, "user_name": user_name or "", "printer_name": printer_name or "",
+            "site_id": site_id, "print_server_id": print_server_id, "color": color or "", "q": q or "",
+            "sites": db.query(Site).order_by(Site.name).all(),
+            "print_servers": db.query(PrintServer).order_by(PrintServer.server_name).all(),
+            "departments": db.query(Department).filter_by(is_active=True).order_by(Department.name).all(),
+            "page": page, "page_size": page_size, "total": total, "total_pages": total_pages,
+            "currency": get_settings().currency,
+        },
+    )
+
+
 @app.get("/export")
 def export_page(request: Request, current_user: AppUser = Depends(require_login)):
     return templates.TemplateResponse(
@@ -232,25 +329,28 @@ def export_csv(
     department_id: Optional[int] = None,
     user_name: Optional[str] = None,
     printer_name: Optional[str] = None,
+    site_id: Optional[int] = None,
+    print_server_id: Optional[int] = None,
+    color: Optional[str] = None,
+    q: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_login),
 ):
-    d_from, d_to, _, _ = date_filters(date_from, date_to)
-    rows = queries.list_jobs(
-        db, limit=1_000_000, date_from=d_from, date_to=d_to,
-        department_id=department_id, user_name=user_name, printer_name=printer_name,
+    filters, _, _ = _job_filters(
+        date_from, date_to, department_id, user_name, printer_name, site_id, print_server_id, color, q
     )
+    rows = queries.list_jobs(db, limit=1_000_000, **filters)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(
-        ["time_created", "user_name", "department_id", "printer_name",
-         "document_name", "total_pages", "is_color", "price_per_page", "cost"]
-    )
+    columns = [
+        "id", "job_id", "time_created", "site", "print_server", "user_name", "department",
+        "printer_name", "document_name", "source_computer", "total_pages", "copies",
+        "pages_per_copy", "is_color", "color_source", "price_per_page", "currency", "cost",
+    ]
+    writer.writerow(columns)
     for j in rows:
-        writer.writerow(
-            [j.time_created.isoformat(), j.user_name, j.department_id, j.printer_name,
-             j.document_name, j.total_pages, j.is_color, j.price_per_page, j.cost]
-        )
+        row = _job_to_dict(j)
+        writer.writerow([row[c] for c in columns])
     buf.seek(0)
     filename = f"print_jobs_{date.today().isoformat()}.csv"
     return StreamingResponse(
@@ -267,31 +367,26 @@ def api_print_jobs(
     department_id: Optional[int] = None,
     user_name: Optional[str] = None,
     printer_name: Optional[str] = None,
+    site_id: Optional[int] = None,
+    print_server_id: Optional[int] = None,
+    color: Optional[str] = None,
+    q: Optional[str] = None,
     limit: int = 200,
     offset: int = 0,
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_login),
 ):
-    d_from, d_to, _, _ = date_filters(date_from, date_to)
-    rows = queries.list_jobs(
-        db, limit=limit, offset=offset, date_from=d_from, date_to=d_to,
-        department_id=department_id, user_name=user_name, printer_name=printer_name,
+    filters, _, _ = _job_filters(
+        date_from, date_to, department_id, user_name, printer_name, site_id, print_server_id, color, q
     )
-    return [
-        {
-            "id": j.id,
-            "time_created": j.time_created.isoformat(),
-            "user_name": j.user_name,
-            "department_id": j.department_id,
-            "printer_name": j.printer_name,
-            "document_name": j.document_name,
-            "total_pages": j.total_pages,
-            "is_color": j.is_color,
-            "price_per_page": j.price_per_page,
-            "cost": j.cost,
-        }
-        for j in rows
-    ]
+    limit = min(max(limit, 1), 1000)
+    offset = max(offset, 0)
+    total = queries.count_jobs(db, **filters)
+    rows = queries.list_jobs(db, limit=limit, offset=offset, **filters)
+    return JSONResponse(
+        content=[_job_to_dict(j) for j in rows],
+        headers={"X-Total-Count": str(total)},
+    )
 
 
 @app.get("/api/stats/by-department")

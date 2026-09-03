@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Журнал заданий печати</h1>
+
+<form class="filters" method="get">
+  <div><label>С</label><input type="date" name="date_from" value="{{ date_from }}"></div>
+  <div><label>По</label><input type="date" name="date_to" value="{{ date_to }}"></div>
+  <div>
+    <label>Площадка</label>
+    <select name="site_id">
+      <option value="">все</option>
+      {% for s in sites %}
+      <option value="{{ s.id }}" {% if site_id == s.id %}selected{% endif %}>{{ s.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label>Print Server</label>
+    <select name="print_server_id">
+      <option value="">все</option>
+      {% for ps in print_servers %}
+      <option value="{{ ps.id }}" {% if print_server_id == ps.id %}selected{% endif %}>{{ ps.display_name or ps.server_name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label>Отдел</label>
+    <select name="department_id">
+      <option value="">все</option>
+      {% for d in departments %}
+      <option value="{{ d.id }}" {% if department_id == d.id %}selected{% endif %}>{{ d.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div><label>Пользователь</label><input type="text" name="user_name" value="{{ user_name }}" placeholder="DOMAIN\login"></div>
+  <div><label>Принтер</label><input type="text" name="printer_name" value="{{ printer_name }}"></div>
+  <div>
+    <label>Цвет</label>
+    <select name="color">
+      <option value="" {% if not color %}selected{% endif %}>любой</option>
+      <option value="color" {% if color == "color" %}selected{% endif %}>Цветная</option>
+      <option value="bw" {% if color == "bw" %}selected{% endif %}>Ч/б</option>
+      <option value="unknown" {% if color == "unknown" %}selected{% endif %}>Не определено</option>
+    </select>
+  </div>
+  <div><label>Документ содержит</label><input type="text" name="q" value="{{ q }}"></div>
+  <input type="hidden" name="page_size" value="{{ page_size }}">
+  <button type="submit">Применить</button>
+</form>
+
+<p class="muted">Найдено заданий: {{ total }}. Страница {{ page }} из {{ total_pages }}.</p>
+
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>Дата/время</th><th>Площадка</th><th>Print Server</th><th>Пользователь</th><th>Отдел</th>
+    <th>Принтер</th><th>Документ</th><th>Компьютер</th><th>Страниц</th><th>Цвет</th>
+    <th>Стоимость ({{ currency }})</th><th>ID задания</th>
+  </tr>
+  {% for j in rows %}
+  <tr>
+    <td>{{ j.time_created.strftime("%Y-%m-%d %H:%M:%S") }}</td>
+    <td>{{ j.site.name if j.site else j.site_code }}</td>
+    <td>{{ (j.print_server.display_name or j.print_server.server_name) if j.print_server else "—" }}</td>
+    <td>{{ j.user_name }}</td>
+    <td>{{ j.department.name if j.department else "(без отдела)" }}</td>
+    <td><a href="/print-jobs?printer_name={{ j.printer_name | urlencode }}&date_from={{ date_from }}&date_to={{ date_to }}">{{ j.printer_name }}</a></td>
+    <td>{{ j.document_name or "" }}</td>
+    <td>{{ j.source_computer or "" }}</td>
+    <td>{{ j.total_pages }}{% if j.copies %} ({{ j.copies }}×{{ j.pages_per_copy }}){% endif %}</td>
+    <td>
+      {% if j.is_color is true %}Цветная
+      {% elif j.is_color is false %}Ч/б
+      {% else %}<span class="badge badge-missing">не определено</span>
+      {% endif %}
+    </td>
+    <td>{{ "%.2f"|format(j.cost) if j.cost is not none else "" }}</td>
+    <td>{{ j.job_id or j.id }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="12" class="empty-state">Заданий не найдено по выбранным фильтрам</td></tr>
+  {% endfor %}
+</table>
+</div>
+
+<p class="pager">
+  {% set base_qs = "date_from=" ~ date_from ~ "&date_to=" ~ date_to ~ "&site_id=" ~ (site_id or "") ~ "&print_server_id=" ~ (print_server_id or "") ~ "&department_id=" ~ (department_id or "") ~ "&user_name=" ~ (user_name | urlencode) ~ "&printer_name=" ~ (printer_name | urlencode) ~ "&color=" ~ color ~ "&q=" ~ (q | urlencode) ~ "&page_size=" ~ page_size %}
+  {% if page > 1 %}<a href="/print-jobs?{{ base_qs }}&page={{ page - 1 }}">&laquo; Назад</a>{% else %}<span class="muted">&laquo; Назад</span>{% endif %}
+  &nbsp;|&nbsp;
+  {% if page < total_pages %}<a href="/print-jobs?{{ base_qs }}&page={{ page + 1 }}">Вперёд &raquo;</a>{% else %}<span class="muted">Вперёд &raquo;</span>{% endif %}
+</p>
+{% endblock %}
