@@ -3,13 +3,22 @@
 Аналог MyQ для нескольких объектов. Учёт идёт на уровне **Windows Print
 Server Event Log**, а не устройства — работает с любыми принтерами (HP,
 Kyocera, Canon и т.д.), пока печать проходит через очереди печати сервера.
-Доступ к отчётам и админке — только через Active Directory, с ролями
-`superadmin` / `admin` / `viewer`.
+Доступ к отчётам и админке — через локальные учётки и/или Active Directory
+(оба независимо опциональны), с ролями `superadmin` / `admin` / `viewer`.
+
+Помимо обычного standalone-режима (один сервер, одна БД) приложение умеет
+работать как **агент** на площадке (собирает локально и досылает события в
+центр через durable outbox, переживая обрывы связи) и как **центр**
+(принимает события от агентов со всех площадок, единый веб-интерфейс и
+отчётность с фильтром по площадке) — см.
+[docs/MULTISITE_ARCHITECTURE.md](docs/MULTISITE_ARCHITECTURE.md). Стандартный
+однообъектный сценарий не меняется ни в чём, если центр вам не нужен.
 
 См. также: [docs/RESEARCH.md](docs/RESEARCH.md) (какие открытые решения
 рассматривались и почему выбран этот стек), [docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md)
 (эксплуатация: AD, миграции, принтеры, тарифы, бэкап), [docs/ROADMAP.md](docs/ROADMAP.md)
-(развитие после пилота).
+(развитие после пилота), [docs/MULTISITE_ARCHITECTURE.md](docs/MULTISITE_ARCHITECTURE.md)
+(режимы standalone/agent/central, гарантии доставки, идемпотентность).
 
 ## Архитектура
 
@@ -47,28 +56,49 @@ Get-Printer ──> printers/Export-Printers.ps1 ──> /admin/printers "Обн
 только `config/config.yaml` (`site_code`, БД, откалиброванный `field_map`,
 тарифы по умолчанию), `.env` (параметры AD/сессий — секреты) и локальная БД.
 
+При `APP_MODE=agent` (см. [docs/MULTISITE_ARCHITECTURE.md](docs/MULTISITE_ARCHITECTURE.md))
+к этой же схеме добавляется исходящая (агент → центр, никогда наоборот)
+HTTPS-отправка через `collector/agent_sync.py`, отдельным заданием
+Task Scheduler:
+
+```
+print_jobs (локально) ──atomic──> outbox_events
+                                       │  collector/agent_sync.py, каждые 1-2 мин
+                                       ▼
+                     POST /api/v1/agent/events/batch (bearer-токен)
+                                       │
+                                       ▼
+                центральный webapp/agent_api.py ──> print_jobs (центр)
+```
+
 ## Структура репозитория
 
 ```
 printaudit/            общий Python-пакет
   ad/                    LDAP-клиент (ldap3) — вход, поиск пользователей/групп
   printers/              обнаружение очередей (Get-Printer) и резолвинг тарифа
-  security/              серверные сессии, CSRF
+  security/              серверные сессии, CSRF, пароли, токены агентов
   models.py              вся схема БД (SQLAlchemy)
   admin_users.py         правила назначения ролей (защита superadmin и т.п.)
   department_resolver.py правила "AD-группа -> отдел", резолвинг для заданий печати
   audit.py               запись в audit_log
+  sites.py               Site/PrintServer — авто-регистрация, вычисляемый статус
+  agent_settings.py      APP_MODE (standalone/agent/central) и настройки агента
 collector/             сбор событий печати (PowerShell + Python)
+  collect_print_events.py локальный сбор Event 307 -> print_jobs (+ outbox в agent-режиме)
+  agent_sync.py            отправка durable outbox в центр (только APP_MODE=agent)
 printers/              Export-Printers.ps1 (Get-Printer, только чтение)
-webapp/                FastAPI: отчёты, вход/выход, /admin/*
+webapp/                FastAPI: отчёты, журнал заданий, вход/выход, /admin/*
+  agent_api.py            /api/v1/agent/* — приём событий от агентов (только центр)
 alembic/               миграции БД (versions/ — по одной ревизии на этап)
-scripts/               init_db.py, sync_users_departments.py, bootstrap_superadmin.py
+scripts/               init_db.py, sync_users_departments.py, bootstrap_superadmin.py,
+                        agent_diagnose.py (диагностика соединения агента с центром)
 config/                config.example.yaml, users_departments.example.csv
-.env.example           переменные AD/сессий (реальный .env — НЕ в Git)
+.env.example           переменные AD/сессий/агента (реальный .env — НЕ в Git)
 db/schema.sql           справочная DDL-схема исходных 5 таблиц MVP
-deploy/                Task Scheduler / запуск веб-сервера
-docs/                   исследование, руководство админа, roadmap
-tests/                  135+ тестов (pytest), без реального AD/принтера/домена
+deploy/                Task Scheduler / запуск веб-сервера / синхронизация агента
+docs/                   исследование, руководство админа, roadmap, multisite-архитектура
+tests/                  330+ тестов (pytest), без реального AD/принтера/домена/сети
 data/, logs/            БД и логи (создаются автоматически, не в Git)
 ```
 
@@ -156,9 +186,30 @@ python scripts\bootstrap_superadmin.py --login "DOMAIN\ivanov"
 3. Проверьте `logs\collector.log` — должно быть `вставлено=N`; или откройте
    `/admin` (Обзор) — там видна история запусков сборщика (sync_runs).
 4. Откройте дашборд (`/`) — задания должны появиться в текущем месяце;
-   проверьте `/by-user`, `/by-printer`, `/export`.
+   проверьте `/by-user`, `/by-printer`, `/print-jobs` (построчный журнал с
+   фильтрами и пагинацией), `/export`.
 5. Попробуйте зайти без логина (`/`, `/export/csv`, `/api/print-jobs`) в окне
    инкогнито — должен быть редирект на `/login` (страницы) или 401 (API/CSV).
+
+## Централизованный сбор с нескольких площадок (опционально)
+
+Обычный однообъектный сценарий выше не требует ничего из этого раздела.
+Если нужен общий центральный сервер с журналом по всем площадкам:
+
+1. Разверните центральный сервер как обычный веб-сервер (шаги выше), задайте
+   `APP_MODE=central` в его `.env`.
+2. Под admin/superadmin на центральном сервере: `/admin/sites` → создать
+   площадку, `/admin/print-servers` → зарегистрировать Print Server —
+   токен агента показывается один раз, скопируйте его сразу.
+3. На сервере площадки — обычная установка standalone (шаги выше) плюс:
+   ```powershell
+   notepad .env   # APP_MODE=agent, CENTRAL_BASE_URL, AGENT_SITE_UUID,
+                  # AGENT_PRINT_SERVER_UUID, AGENT_TOKEN — см. .env.example
+   .\deploy\register_agent_sync_task.ps1
+   .\.venv\Scripts\python.exe scripts\agent_diagnose.py   # проверка связи с центром
+   ```
+4. Подробности, гарантии доставки при обрыве связи и ограничения MVP — в
+   [docs/MULTISITE_ARCHITECTURE.md](docs/MULTISITE_ARCHITECTURE.md).
 
 ## Обновление уже развёрнутого сервера
 
@@ -208,7 +259,10 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-135+ тестов, ни один не требует реального AD-домена, принтера или сети —
-AD замокан через `ldap3` MOCK_SYNC, `Get-Printer` и `Export-PrintEvents.ps1`
-подменяются на уровне `subprocess.run`/фабрик, БД — временный SQLite на
-каждый тест. Подробности — в docs/ADMIN_GUIDE.md, раздел «Тесты».
+330+ тестов, ни один не требует реального AD-домена, принтера, Print Server
+или сети — AD замокан через `ldap3` MOCK_SYNC, `Get-Printer` и
+`Export-PrintEvents.ps1` подменяются на уровне `subprocess.run`/фабрик,
+центральный агентский API и HTTP-клиент агента — через FastAPI TestClient и
+монки на уровне `collector.agent_sync.send_batch`/`send_heartbeat`, БД —
+временный SQLite на каждый тест. Подробности — в docs/ADMIN_GUIDE.md,
+раздел «Тесты».

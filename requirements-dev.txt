@@ -1,3 +1,4 @@
 -r requirements.txt
 pytest==8.3.3
-httpx==0.27.2
+# httpx уже в requirements.txt (используется collector/agent_sync.py) —
+# здесь он и так доступен для FastAPI TestClient, отдельная строка не нужна.

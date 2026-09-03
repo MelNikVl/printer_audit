@@ -1,0 +1,28 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Площадки</h1>
+
+<table>
+  <tr><th>site_code</th><th>Название</th><th>Описание</th><th>Активна</th><th>Создана</th></tr>
+  {% for s in sites %}
+  <tr>
+    <td>{{ s.site_code }}</td>
+    <td>{{ s.name }}</td>
+    <td>{{ s.description or "" }}</td>
+    <td>{% if s.is_active %}<span class="badge badge-active">да</span>{% else %}<span class="badge badge-inactive">нет</span>{% endif %}</td>
+    <td>{{ s.created_at.strftime("%Y-%m-%d") }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="empty-state">Площадок пока нет — standalone-коллектор создаёт свою автоматически при первом запуске</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Новая площадка</h2>
+<form class="filters" method="post" action="/admin/sites/create">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div><label>site_code</label><input type="text" name="site_code" required placeholder="ALMATY-BRANCH2"></div>
+  <div><label>Название</label><input type="text" name="name" placeholder="Алматы, филиал 2"></div>
+  <div><label>Описание</label><input type="text" name="description"></div>
+  <button type="submit">Создать</button>
+</form>
+{% endblock %}

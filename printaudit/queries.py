@@ -6,6 +6,10 @@ from sqlalchemy.orm import Session
 
 from printaudit.models import Department, PrintJob
 
+# color: "color" | "bw" | "unknown" | None (без фильтра) — см.
+# printaudit.printers.resolver про tri-state is_color/color_source.
+VALID_COLOR_FILTERS = ("color", "bw", "unknown")
+
 
 def month_bounds(today: Optional[date] = None):
     today = today or date.today()
@@ -20,6 +24,10 @@ def _apply_filters(
     department_id: Optional[int] = None,
     user_name: Optional[str] = None,
     printer_name: Optional[str] = None,
+    site_id: Optional[int] = None,
+    print_server_id: Optional[int] = None,
+    color: Optional[str] = None,
+    document_search: Optional[str] = None,
 ):
     if date_from:
         query = query.filter(PrintJob.time_created >= date_from)
@@ -31,6 +39,18 @@ def _apply_filters(
         query = query.filter(PrintJob.user_name == user_name)
     if printer_name:
         query = query.filter(PrintJob.printer_name == printer_name)
+    if site_id:
+        query = query.filter(PrintJob.site_id == site_id)
+    if print_server_id:
+        query = query.filter(PrintJob.print_server_id == print_server_id)
+    if color == "color":
+        query = query.filter(PrintJob.is_color.is_(True))
+    elif color == "bw":
+        query = query.filter(PrintJob.is_color.is_(False))
+    elif color == "unknown":
+        query = query.filter(PrintJob.is_color.is_(None))
+    if document_search:
+        query = query.filter(PrintJob.document_name.ilike(f"%{document_search}%"))
     return query
 
 
@@ -101,6 +121,12 @@ def by_printer(session: Session, **filters) -> list[dict]:
 
 
 def list_jobs(session: Session, limit: int = 200, offset: int = 0, **filters) -> list[PrintJob]:
-    q = session.query(PrintJob).order_by(PrintJob.time_created.desc())
+    q = session.query(PrintJob).order_by(PrintJob.time_created.desc(), PrintJob.id.desc())
     q = _apply_filters(q, **filters)
     return q.offset(offset).limit(limit).all()
+
+
+def count_jobs(session: Session, **filters) -> int:
+    q = session.query(func.count(PrintJob.id))
+    q = _apply_filters(q, **filters)
+    return int(q.scalar() or 0)

@@ -212,3 +212,13 @@ tr:hover td { background: #fafbfc; }
 .chart-wrap { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 24px; }
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 @media (max-width: 800px) { .two-col { grid-template-columns: 1fr; } }
+.muted { color: #6b7280; font-size: 13px; }
+.table-scroll { overflow-x: auto; }
+.pager { text-align: center; font-size: 13px; }
+.pager a { color: #2563eb; text-decoration: none; }
+.pager a:hover { text-decoration: underline; }
+.status-online { color: #065f46; font-weight: 600; }
+.status-warning { color: #92400e; font-weight: 600; }
+.status-offline { color: #991b1b; font-weight: 600; }
+.status-pending { color: #6b7280; }
+.status-disabled { color: #9ca3af; text-decoration: line-through; }

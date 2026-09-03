@@ -3,8 +3,16 @@
 
 # Уникальный код площадки — попадает в каждую запись print_jobs.site_code.
 # Нужен уже сейчас, чтобы в будущем можно было безболезненно объединить БД всех 4 объектов
-# в одну центральную (см. docs/ROADMAP.md).
+# в одну центральную (см. docs/MULTISITE_ARCHITECTURE.md, docs/ROADMAP.md).
 site_code: "ALMATY-HQ"
+
+# Имя ЭТОГО Windows Print Server — по умолчанию берётся реальное имя
+# компьютера (socket.gethostname()), эту строку можно не трогать вообще,
+# если у вас один сервер на площадку. Используется только для локальной
+# авто-регистрации Site+PrintServer В СВОЕЙ ЖЕ БД (см. printaudit/sites.py) —
+# это НЕ то же самое, что AGENT_SITE_UUID/AGENT_PRINT_SERVER_UUID в .env,
+# которыми агент представляется ЦЕНТРАЛЬНОМУ серверу.
+# server_name: "PRINTSRV01"
 
 db:
   # SQLite (по умолчанию, для пилота) — путь относительно корня репозитория:
@@ -42,6 +50,23 @@ collector:
     user_name: 2
     printer_name: 4
     total_pages: 8
+    # Необязательные поля — добавляйте ТОЛЬКО если реально нашли и проверили
+    # соответствующий индекс на своём сервере (см. calibrate_event_fields.ps1
+    # и docs/MULTISITE_ARCHITECTURE.md про total_pages/копии). Если поле не
+    # указано здесь, коллектор оставляет соответствующую колонку NULL, а не
+    # выдумывает значение:
+    # source_computer: 3
+    # copies: 9
+    # pages_per_copy: 10
+
+# Только для APP_MODE=agent (см. .env.example) — параметры отправки в центр.
+# Секрет агента (AGENT_TOKEN) сюда НЕ входит — он живёт только в .env.
+agent:
+  max_batch_size: 500
+  http_timeout_seconds: 30
+  # Интервал не используется кодом напрямую — это просто подсказка для
+  # -IntervalMinutes при регистрации задачи (см. deploy/register_agent_sync_task.ps1).
+  sync_interval_minutes: 2
 
 currency: "KZT"
 # Тариф по умолчанию, если для принтера нет более конкретного правила в price_list (Ч/Б)

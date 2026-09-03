@@ -1,0 +1,80 @@
+name: Tests
+
+# Полный прогон pytest на windows-latest / Python 3.12 — та же платформа,
+# на которую проект реально разворачивается (Windows Print Server).
+# Никаких секретов не требуется: AD замокан через ldap3 MOCK_SYNC,
+# Get-Printer/Export-PrintEvents.ps1/агентский HTTP-клиент подменяются
+# на уровне subprocess.run/фабрик функций, у каждого теста своя временная
+# SQLite БД (см. tests/conftest.py) — см. docs/ADMIN_GUIDE.md, раздел «Тесты».
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run full test suite
+        run: python -m pytest tests/ -v
+
+      - name: Verify Alembic migrations apply cleanly (fresh SQLite DB, twice for idempotency)
+        shell: python
+        run: |
+          import os, sys, tempfile
+          from pathlib import Path
+
+          tmp = Path(tempfile.mkdtemp(prefix="ci-migration-check-"))
+          db_path = tmp / "ci.db"
+          csv_path = tmp / "users_departments.csv"
+          cfg_path = tmp / "config.yaml"
+          csv_path.write_text("user_name,department_name,cost_center_code\n", encoding="utf-8")
+          cfg_path.write_text(
+              "site_code: \"CI\"\n"
+              "db:\n"
+              f"  url: \"sqlite:///{db_path.as_posix()}\"\n"
+              "paths:\n"
+              f"  users_departments_csv: \"{csv_path.as_posix()}\"\n"
+              f"  log_dir: \"{(tmp / 'logs').as_posix()}\"\n"
+              "collector:\n"
+              "  field_map:\n"
+              "    job_id: 0\n"
+              "    document_name: 1\n"
+              "    user_name: 2\n"
+              "    printer_name: 4\n"
+              "    total_pages: 8\n"
+              "currency: \"KZT\"\n"
+              "default_price_per_page_bw: 8\n"
+              "default_price_per_page_color: 40\n",
+              encoding="utf-8",
+          )
+          os.environ["PRINTAUDIT_CONFIG"] = str(cfg_path)
+
+          from alembic import command
+          from alembic.config import Config
+
+          repo_root = Path(".").resolve()
+          cfg = Config(str(repo_root / "alembic.ini"))
+          cfg.set_main_option("script_location", str(repo_root / "alembic"))
+
+          command.upgrade(cfg, "head")
+          command.upgrade(cfg, "head")  # idempotency check
+          print("Migrations applied cleanly, twice, on a fresh SQLite DB.")

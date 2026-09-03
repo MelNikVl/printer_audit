@@ -54,9 +54,19 @@ def test_disabled_printer_queue_skips_new_jobs(app_env, monkeypatch):
     import collector.collect_print_events as cpe
     from printaudit.database import SessionLocal
     from printaudit.models import PrinterQueue
+    from printaudit.sites import get_or_create_local_print_server
 
     session = SessionLocal()
-    session.add(PrinterQueue(printer_name="HP-3F-BW", display_name="HP-3F-BW", collection_enabled=False))
+    # Очередь должна быть привязана к тому же (авто-заведённому) локальному
+    # print_server, который коллектор будет искать при следующем прогоне —
+    # см. printaudit.models.PrinterQueue.uq_printer_queues_server_name.
+    print_server = get_or_create_local_print_server(session)
+    session.add(
+        PrinterQueue(
+            printer_name="HP-3F-BW", print_server_id=print_server.id,
+            display_name="HP-3F-BW", collection_enabled=False,
+        )
+    )
     session.commit()
     session.close()
 
