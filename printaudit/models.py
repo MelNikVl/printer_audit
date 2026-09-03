@@ -126,6 +126,15 @@ class PrintJob(Base):
     printer_queue_id = Column(Integer, ForeignKey("printer_queues.id"), nullable=True, index=True)
     site_id = Column(Integer, ForeignKey("sites.id"), nullable=True, index=True)
     print_server_id = Column(Integer, ForeignKey("print_servers.id"), nullable=True, index=True)
+    # Задание пришло НЕ с Print Server, а с конечного ПК (USB/WSD/прямой
+    # IP-принтер) через endpoint-агента (см. printaudit.models.EndpointAgent
+    # и docs/PRINTER_MONITORING_FORECASTING.md) — ровно один из
+    # print_server_id/endpoint_agent_id заполнен, никогда оба сразу (иначе
+    # задание было бы учтено дважды: и на Print Server, и на ПК). Отдельный
+    # UNIQUE(endpoint_agent_id, record_id) — тот же принцип идемпотентности,
+    # что и у print_server_id, но record_id здесь — EventRecordID ЛОКАЛЬНОГО
+    # PrintService-журнала конкретного ПК, не сервера.
+    endpoint_agent_id = Column(Integer, ForeignKey("endpoint_agents.id"), nullable=True, index=True)
     # Тариф и цена ЗАФИКСИРОВАНЫ на момент вставки и больше не пересчитываются
     # при изменении price_rules/price_list — price_rule_id — это только ссылка
     # для трассировки "почему так посчитано", а не источник истины для отчётов.
@@ -139,9 +148,11 @@ class PrintJob(Base):
     printer_queue = relationship("PrinterQueue")
     site = relationship("Site")
     print_server = relationship("PrintServer")
+    endpoint_agent = relationship("EndpointAgent")
 
     __table_args__ = (
         UniqueConstraint("print_server_id", "record_id", name="uq_print_jobs_server_record"),
+        UniqueConstraint("endpoint_agent_id", "record_id", name="uq_print_jobs_endpoint_record"),
     )
 
 
@@ -527,3 +538,325 @@ class OutboxEvent(Base):
     updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
 
     print_job = relationship("PrintJob")
+
+
+# ---------------------------------------------------------------------------
+# Мониторинг физических принтеров, расходников, прогнозирование
+# (см. docs/PRINTER_MONITORING_FORECASTING.md)
+# ---------------------------------------------------------------------------
+
+
+class SnmpProfile(Base):
+    """Переиспользуемый набор OID для одного семейства/модели принтеров
+    (Printer-MIB как база + vendor-specific OID поверх). Community/учётные
+    данные SNMPv3 сюда НЕ входят — только ИМЯ переменной окружения, где они
+    реально лежат (см. printaudit.monitoring.snmp_adapter); секреты никогда
+    не хранятся в БД в открытом виде."""
+
+    __tablename__ = "snmp_profiles"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(200), unique=True, nullable=False)
+    description = Column(Text, nullable=True)
+    # SNMPv3 предпочтителен; "v2c" оставлен для принтеров, которые его не
+    # поддерживают (осознанный выбор администратора, не дефолт).
+    snmp_version = Column(String(10), nullable=False, default="v3")
+    # Имя переменной(ых) окружения с реальными credentials, например
+    # "SNMP_CRED_HP_LASERJET" -> см. .env.example. НЕ сам секрет.
+    credentials_env_var = Column(String(200), nullable=True)
+    port = Column(Integer, nullable=False, default=161)
+    timeout_seconds = Column(Float, nullable=False, default=2.0)
+    retries = Column(Integer, nullable=False, default=1)
+    # JSON: {"total_pages": "1.3.6.1.2.1.43.10.2.1.4.1.1", "toner_black": "...", ...}
+    # Печатается словарём field_name -> OID, расширяемо под конкретный вендор
+    # без миграции схемы (см. printaudit.monitoring.snmp_adapter.DEFAULT_OIDS
+    # за примером Printer-MIB-базовых значений по умолчанию).
+    oid_map_json = Column(Text, nullable=False, default="{}")
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+
+class PrinterDevice(Base):
+    """Физическое устройство — НЕ то же самое, что PrinterQueue (одна
+    физическая машина может печатать через несколько очередей — BW/Color на
+    один МФУ, см. docs/ADMIN_GUIDE.md — а одна очередь может со временем
+    менять физический порт/устройство). Связь с очередями — управляемая
+    (PrinterDeviceQueueLink), НЕ автоматическая по имени/IP: два принтера
+    могут называться одинаково на разных площадках, а один физический
+    принтер может сменить IP при перевыпуске DHCP-аренды — ни то, ни другое
+    не должно молча объединять/разъединять устройства без явного действия
+    администратора (см. audit_log на каждое изменение связи)."""
+
+    __tablename__ = "printer_devices"
+
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String(36), unique=True, nullable=False, default=_new_uuid)
+    site_id = Column(Integer, ForeignKey("sites.id"), nullable=False, index=True)
+    print_server_id = Column(Integer, ForeignKey("print_servers.id"), nullable=True, index=True)
+    display_name = Column(String(200), nullable=False)
+    hostname = Column(String(255), nullable=True)
+    ip_address = Column(String(64), nullable=True)
+    mac_address = Column(String(32), nullable=True)
+    serial_number = Column(String(100), nullable=True)
+    vendor = Column(String(100), nullable=True)
+    model = Column(String(100), nullable=True)
+    snmp_profile_id = Column(Integer, ForeignKey("snmp_profiles.id"), nullable=True)
+
+    # zabbix_api | direct_snmp | manual | disabled — см.
+    # printaudit.monitoring.MONITORING_SOURCES. "disabled" — устройство
+    # заведено (для связи с очередями/отчётности), но не опрашивается.
+    monitoring_source = Column(String(20), nullable=False, default="disabled")
+    # ID хоста в Zabbix (для zabbix_api) — сопоставление настраивает админ,
+    # не угадывается автоматически.
+    zabbix_host_id = Column(String(100), nullable=True)
+
+    # Кэш последнего вычисленного статуса — для быстрого списка без JOIN на
+    # последний PrinterHealthSample; ИСТОЧНИК истины — сами сэмплы, это поле
+    # только обновляется при приёме нового сэмпла (см.
+    # printaudit.monitoring.status.compute_device_status) и не считается
+    # надёжным само по себе, если last_seen_at сильно устарел — на странице
+    # устройства статус всегда пересчитывается заново по возрасту last_seen_at.
+    last_status = Column(String(20), nullable=False, default="unknown")
+    last_seen_at = Column(DateTime, nullable=True)
+
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    site = relationship("Site")
+    print_server = relationship("PrintServer")
+    snmp_profile = relationship("SnmpProfile")
+
+
+class PrinterDeviceQueueLink(Base):
+    """Управляемая (не автоматическая) связь физического устройства с
+    очередью печати — одно устройство может иметь несколько очередей
+    (BW/Color), см. PrinterDevice. Изменения ВСЕГДА идут через audit_log
+    (см. printaudit.monitoring.devices.link_queue/unlink_queue)."""
+
+    __tablename__ = "printer_device_queue_links"
+
+    id = Column(Integer, primary_key=True)
+    printer_device_id = Column(Integer, ForeignKey("printer_devices.id"), nullable=False, index=True)
+    printer_queue_id = Column(Integer, ForeignKey("printer_queues.id"), nullable=False, index=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    linked_by_id = Column(Integer, ForeignKey("app_users.id"), nullable=True)
+    linked_at = Column(DateTime, nullable=False, default=_utcnow)
+    unlinked_by_id = Column(Integer, ForeignKey("app_users.id"), nullable=True)
+    unlinked_at = Column(DateTime, nullable=True)
+
+    printer_device = relationship("PrinterDevice")
+    printer_queue = relationship("PrinterQueue")
+
+    __table_args__ = (
+        UniqueConstraint("printer_device_id", "printer_queue_id", name="uq_device_queue_link"),
+    )
+
+
+class MonitoringRun(Base):
+    """История прогонов опроса устройств (аналог SyncRun для мониторинга,
+    не для печати) — что показывается на карточке площадки/устройства как
+    "когда последний раз опрашивали и что вышло"."""
+
+    __tablename__ = "monitoring_runs"
+
+    id = Column(Integer, primary_key=True)
+    site_id = Column(Integer, ForeignKey("sites.id"), nullable=True, index=True)
+    source = Column(String(20), nullable=False, index=True)  # zabbix_api | direct_snmp
+    started_at = Column(DateTime, nullable=False, default=_utcnow)
+    finished_at = Column(DateTime, nullable=True)
+    status = Column(String(20), nullable=False, default="running")  # running | success | failed
+    devices_polled = Column(Integer, nullable=False, default=0)
+    devices_ok = Column(Integer, nullable=False, default=0)
+    devices_failed = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text, nullable=True)
+
+
+class PrinterHealthSample(Base):
+    """Один снимок состояния устройства (достижимость, статус, флаги
+    ошибок) на момент опроса. `collected_at` округляется до интервала
+    опроса на стороне коллектора для идемпотентности повторного прогона —
+    см. printaudit.monitoring.ingest."""
+
+    __tablename__ = "printer_health_samples"
+
+    id = Column(Integer, primary_key=True)
+    printer_device_id = Column(Integer, ForeignKey("printer_devices.id"), nullable=False, index=True)
+    monitoring_run_id = Column(Integer, ForeignKey("monitoring_runs.id"), nullable=True, index=True)
+    collected_at = Column(DateTime, nullable=False, index=True)
+    source = Column(String(20), nullable=False)  # zabbix_api | direct_snmp | manual
+
+    # None = достоверно неизвестно (не путать с False = точно недоступен).
+    is_reachable = Column(Boolean, nullable=True)
+    # online | warning | error | offline | unknown — НЕ "здоровый по
+    # умолчанию": unknown, если источник не смог определить статус.
+    device_status = Column(String(20), nullable=False, default="unknown")
+    has_paper_jam = Column(Boolean, nullable=True)
+    has_cover_open = Column(Boolean, nullable=True)
+    has_paper_out = Column(Boolean, nullable=True)
+    has_hardware_error = Column(Boolean, nullable=True)
+    raw_status_text = Column(String(500), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    printer_device = relationship("PrinterDevice")
+
+    __table_args__ = (
+        UniqueConstraint("printer_device_id", "collected_at", "source", name="uq_health_sample"),
+    )
+
+
+class PrinterCounterSample(Base):
+    """Собственный (аппаратный) счётчик страниц устройства — независимый
+    сигнал от того, что Print Audit насчитал по print_jobs (полезно для
+    сверки/обнаружения печати мимо учёта). NULL, а не 0, если счётчик не
+    поддерживается/не прочитан — см. docs/PRINTER_MONITORING_FORECASTING.md."""
+
+    __tablename__ = "printer_counter_samples"
+
+    id = Column(Integer, primary_key=True)
+    printer_device_id = Column(Integer, ForeignKey("printer_devices.id"), nullable=False, index=True)
+    monitoring_run_id = Column(Integer, ForeignKey("monitoring_runs.id"), nullable=True, index=True)
+    collected_at = Column(DateTime, nullable=False, index=True)
+    source = Column(String(20), nullable=False)
+
+    total_pages = Column(Integer, nullable=True)
+    color_pages = Column(Integer, nullable=True)
+    bw_pages = Column(Integer, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    printer_device = relationship("PrinterDevice")
+
+    __table_args__ = (
+        UniqueConstraint("printer_device_id", "collected_at", "source", name="uq_counter_sample"),
+    )
+
+
+class PrinterSupplySample(Base):
+    """Уровень одного расходника (тонер/картридж/барабан/лоток/...) на
+    момент опроса — одна строка на (устройство, момент, тип расходника).
+    `level_percent=NULL` + `level_status="unknown"` — ЕДИНСТВЕННО верное
+    значение при отсутствии/неподдержке OID, НИКОГДА не 0/"empty" по
+    умолчанию (см. требование не путать "неизвестно" с "закончилось")."""
+
+    __tablename__ = "printer_supply_samples"
+
+    id = Column(Integer, primary_key=True)
+    printer_device_id = Column(Integer, ForeignKey("printer_devices.id"), nullable=False, index=True)
+    monitoring_run_id = Column(Integer, ForeignKey("monitoring_runs.id"), nullable=True, index=True)
+    collected_at = Column(DateTime, nullable=False, index=True)
+    source = Column(String(20), nullable=False)
+
+    # toner_black | toner_cyan | toner_magenta | toner_yellow | drum |
+    # fuser | waste_toner | tray_1 | ... — расширяемый список, не Enum
+    # (та же причина, что и у printaudit.roles: не тащить миграцию enum-типа
+    # под каждую новую модель принтера).
+    supply_type = Column(String(40), nullable=False)
+    level_percent = Column(Float, nullable=True)
+    level_status = Column(String(20), nullable=False, default="unknown")  # ok|low|critical|empty|unknown
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    printer_device = relationship("PrinterDevice")
+
+    __table_args__ = (
+        UniqueConstraint("printer_device_id", "collected_at", "source", "supply_type", name="uq_supply_sample"),
+    )
+
+
+class PrinterAlert(Base):
+    """Активная/закрытая проблема устройства (замятие, крышка открыта,
+    низкий тонер, offline, аппаратная ошибка, ...). `external_id` — id
+    проблемы в источнике (например, Zabbix eventid) для идемпотентного
+    upsert без дублирования одной и той же проблемы на каждый опрос."""
+
+    __tablename__ = "printer_alerts"
+
+    id = Column(Integer, primary_key=True)
+    printer_device_id = Column(Integer, ForeignKey("printer_devices.id"), nullable=False, index=True)
+    source = Column(String(20), nullable=False)
+    alert_type = Column(String(40), nullable=False, index=True)
+    severity = Column(String(20), nullable=False, default="warning")  # info | warning | critical
+    message = Column(Text, nullable=True)
+    opened_at = Column(DateTime, nullable=False, index=True)
+    resolved_at = Column(DateTime, nullable=True)
+    external_id = Column(String(200), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    printer_device = relationship("PrinterDevice")
+
+    __table_args__ = (
+        UniqueConstraint("printer_device_id", "alert_type", "external_id", name="uq_printer_alert"),
+    )
+
+
+class EndpointAgent(Base):
+    """Endpoint-агент на пользовательском Windows ПК — учитывает USB/WSD/
+    прямые IP-принтеры, которые НЕ проходят через Print Server (см.
+    docs/PRINTER_MONITORING_FORECASTING.md). Токен — тот же принцип, что и у
+    PrintServer (printaudit.security.agent_tokens): хэш в БД, сырой токен
+    показывается один раз при регистрации/ротации. Регистрируется на
+    ЛОКАЛЬНОМ сервере площадки (не в центральном /admin/print-servers) —
+    endpoint-агенты шлют данные на свою площадку, площадка уже пересылает
+    их в центр как обычные print_jobs (см. PrintJob.endpoint_agent_id)."""
+
+    __tablename__ = "endpoint_agents"
+
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String(36), unique=True, nullable=False, default=_new_uuid)
+    site_id = Column(Integer, ForeignKey("sites.id"), nullable=False, index=True)
+    hostname = Column(String(255), nullable=False)
+    display_name = Column(String(200), nullable=True)
+    agent_version = Column(String(50), nullable=True)
+    last_heartbeat_at = Column(DateTime, nullable=True)
+    last_contact_at = Column(DateTime, nullable=True)
+    last_sync_at = Column(DateTime, nullable=True)
+    pending_queue_size = Column(Integer, nullable=True)
+    failed_queue_size = Column(Integer, nullable=True)
+    last_error = Column(Text, nullable=True)
+    is_disabled = Column(Boolean, nullable=False, default=False)
+    token_hash = Column(String(128), nullable=True)
+    token_created_at = Column(DateTime, nullable=True)
+    token_rotated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    site = relationship("Site")
+
+    __table_args__ = (
+        UniqueConstraint("site_id", "hostname", name="uq_endpoint_agents_site_hostname"),
+    )
+
+
+class ForecastRun(Base):
+    """Персистентный результат последнего расчёта прогноза — считается по
+    расписанию (не на каждый просмотр страницы), см.
+    printaudit.forecasting. `scope_type`+`scope_id` определяют объект
+    прогноза (device/queue/site/None-для-org), `metric`+`horizon_days` —
+    что и на сколько дней. Хранит и точность бэктеста (WAPE/MAE), и версию
+    модели/дату расчёта, чтобы UI мог честно показать, насколько свежий и
+    насколько точный прогноз, а не выдавать голое число."""
+
+    __tablename__ = "forecast_runs"
+
+    id = Column(Integer, primary_key=True)
+    scope_type = Column(String(20), nullable=False, index=True)  # device | queue | site | org
+    scope_id = Column(Integer, nullable=True, index=True)  # NULL для org
+    metric = Column(String(30), nullable=False)  # jobs | pages | color_pages | bw_pages | cost
+    horizon_days = Column(Integer, nullable=False)  # 7 | 30 | 90
+
+    model_name = Column(String(50), nullable=True)  # seasonal_naive | moving_average | exp_smoothing
+    model_version = Column(String(20), nullable=True)
+    computed_at = Column(DateTime, nullable=False, default=_utcnow)
+    history_days_used = Column(Integer, nullable=False, default=0)
+    wape = Column(Float, nullable=True)
+    mae = Column(Float, nullable=True)
+    # True -> недостаточно истории, forecast_json пуст, UI обязан показать
+    # "Недостаточно данных", а не рисовать несуществующую точность.
+    insufficient_history = Column(Boolean, nullable=False, default=False)
+    # JSON-список [{"date": "...", "point": .., "lower": .., "upper": ..}, ...]
+    forecast_json = Column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("scope_type", "scope_id", "metric", "horizon_days", name="uq_forecast_run"),
+    )
