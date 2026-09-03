@@ -55,6 +55,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
+from sqlalchemy import and_, or_
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from printaudit.agent_settings import (  # noqa: E402
@@ -238,11 +240,19 @@ def _get_or_create_monitoring_sync_state(session, site_id: int) -> MonitoringSyn
 
 def _build_monitoring_payload(session, site, state: MonitoringSyncState, limit: int):
     """Курсор по id для health/counter/supply (только INSERT — id
-    монотонно растёт); по updated_at для алертов (они ещё и обновляются
-    при resolve). Устройства отправляются ВСЕ активные с включённым
-    мониторингом каждый раз, когда есть хоть один сэмпл/алерт для отправки
-    — дёшево (обычно десятки-сотни устройств на площадку) и гарантирует,
-    что центр успеет узнать о новом устройстве до первого сэмпла на него."""
+    монотонно растёт); СОСТАВНОЙ курсор (updated_at, id) для алертов (они
+    ещё и обновляются при resolve, а не только создаются) — одного
+    updated_at недостаточно: несколько алертов могут получить одинаковый
+    updated_at (один опрос устройства создаёт/обновляет несколько строк
+    практически в одну и ту же метку времени), и если limit меньше их
+    числа, курсор по одному updated_at продвинулся бы мимо ещё не
+    отправленных строк с тем же значением — они пропали бы навсегда (см.
+    printaudit/models.py::MonitoringSyncState.last_alert_synced_id и
+    tests/test_agent_sync_monitoring.py за регрессионным тестом). Устройства
+    отправляются ВСЕ активные с включённым мониторингом каждый раз, когда
+    есть хоть один сэмпл/алерт для отправки — дёшево (обычно десятки-сотни
+    устройств на площадку) и гарантирует, что центр успеет узнать о новом
+    устройстве до первого сэмпла на него."""
     devices = (
         session.query(PrinterDevice)
         .filter(
@@ -278,12 +288,19 @@ def _build_monitoring_payload(session, site, state: MonitoringSyncState, limit: 
         .limit(limit)
         .all()
     )
-    alert_cursor = naive_utc(state.last_alert_synced_at) or datetime(1970, 1, 1)
+    alert_cursor_at = naive_utc(state.last_alert_synced_at) or datetime(1970, 1, 1)
+    alert_cursor_id = state.last_alert_synced_id or 0
     alert_rows = (
         session.query(PrinterAlert)
         .join(PrinterDevice, PrinterAlert.printer_device_id == PrinterDevice.id)
-        .filter(PrinterDevice.site_id == site.id, PrinterAlert.updated_at > alert_cursor)
-        .order_by(PrinterAlert.updated_at)
+        .filter(
+            PrinterDevice.site_id == site.id,
+            or_(
+                PrinterAlert.updated_at > alert_cursor_at,
+                and_(PrinterAlert.updated_at == alert_cursor_at, PrinterAlert.id > alert_cursor_id),
+            ),
+        )
+        .order_by(PrinterAlert.updated_at, PrinterAlert.id)
         .limit(limit)
         .all()
     )
@@ -342,6 +359,7 @@ def _build_monitoring_payload(session, site, state: MonitoringSyncState, limit: 
         "counter_id": counter_rows[-1].id if counter_rows else state.last_counter_sample_id,
         "supply_id": supply_rows[-1].id if supply_rows else state.last_supply_sample_id,
         "alert_at": alert_rows[-1].updated_at if alert_rows else state.last_alert_synced_at,
+        "alert_id": alert_rows[-1].id if alert_rows else alert_cursor_id,
     }
     return payload, cursors
 
@@ -352,7 +370,19 @@ def sync_monitoring_data(session, agent_settings, settings, log, client_override
     значение и так идемпотентно по своим UNIQUE-ограничениям на приёме
     (см. webapp/agent_api.py), поэтому повторная отправка с неподвинутым
     курсором после сбоя безопасна сама по себе, без отдельного состояния
-    на строку."""
+    на строку.
+
+    ВАЖНО про partial reject: центр коммитит принятые элементы пакета и
+    отклонённые ПОРОЗНЬ в одной транзакции (см. webapp/agent_api.py
+    ::agent_monitoring_batch) и возвращает 200 с общим `rejected` > 0, а не
+    отдельными per-item ack'ами (в отличие от /events/batch для заданий
+    печати). Раз нет способа узнать, КАКИЕ именно элементы отклонены, курсор
+    продвигается ТОЛЬКО когда rejected == 0 — иначе принятые элементы того
+    же пакета остались бы недостижимы для повтора (курсор ушёл бы вперёд),
+    а отклонённый элемент был бы потерян навсегда. При rejected > 0 курсор
+    не трогается вовсе, весь пакет уходит целиком повторно при следующей
+    синхронизации — уже принятые элементы при этом идемпотентно определяются
+    центром как duplicate (см. tests/test_agent_sync_monitoring.py)."""
     local_server = get_or_create_local_print_server(session, settings)
     site = local_server.site
     state = _get_or_create_monitoring_sync_state(session, site.id)
@@ -391,10 +421,29 @@ def sync_monitoring_data(session, agent_settings, settings, log, client_override
         log.warning("Мониторинговые данные не отправлены (будет повторная попытка позже): %s", exc)
         return
 
+    rejected = result.get("rejected", 0)
+    if rejected:
+        # НЕ продвигаем ни один курсор -- см. docstring выше. Пакет целиком
+        # повторится при следующей синхронизации; уже принятые элементы
+        # определятся центром как duplicate (идемпотентность по UNIQUE),
+        # ранее отклонённый элемент либо пройдёт (если причина была
+        # временной), либо будет отклонён снова с тем же понятным last_error.
+        state.last_error = (
+            f"Центр отклонил {rejected} элементов пакета мониторинга — курсор не продвинут, "
+            "весь пакет будет отправлен повторно при следующей синхронизации."
+        )
+        session.commit()
+        log.warning(
+            "Мониторинговые данные отправлены, но %d элементов отклонено — курсор НЕ продвинут: %s",
+            rejected, state.last_error,
+        )
+        return
+
     state.last_health_sample_id = cursors["health_id"]
     state.last_counter_sample_id = cursors["counter_id"]
     state.last_supply_sample_id = cursors["supply_id"]
     state.last_alert_synced_at = cursors["alert_at"]
+    state.last_alert_synced_id = cursors["alert_id"]
     state.last_success_at = naive_utc(utcnow())
     state.last_error = None
     session.commit()

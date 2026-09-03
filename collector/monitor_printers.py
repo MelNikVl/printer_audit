@@ -71,7 +71,12 @@ def _poll_zabbix_devices(session, site, devices, log, client=None) -> None:
     started = utcnow()
     run = MonitoringRun(site_id=site.id, source=MONITORING_SOURCE_ZABBIX, started_at=started, status="running")
     session.add(run)
-    session.flush()
+    # commit (не только flush) -- ниже, если опрос устройства провалится,
+    # session.rollback() откатывает ВЕСЬ текущий незакоммиченный transaction;
+    # если бы run был только flush'нут, этот rollback стирал бы и саму
+    # запись MonitoringRun (баг, вскрытый требованием не иметь неявных
+    # fallback-ов при ошибках конфигурации SNMP -- см. snmp_adapter.py).
+    session.commit()
 
     zbx = _get_zabbix_client(client)
     if zbx is None:
@@ -112,7 +117,10 @@ def _poll_snmp_devices(session, site, devices, log, getter=None) -> None:
     started = utcnow()
     run = MonitoringRun(site_id=site.id, source=MONITORING_SOURCE_SNMP, started_at=started, status="running")
     session.add(run)
-    session.flush()
+    # commit, не flush -- см. комментарий в _poll_zabbix_devices выше (тот
+    # же паттерн, тот же риск потерять саму строку MonitoringRun при
+    # rollback после сбоя опроса одного устройства).
+    session.commit()
 
     ok = failed = 0
     for device in devices:

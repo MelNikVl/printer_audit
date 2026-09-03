@@ -173,8 +173,14 @@ class MonitoringSyncState(Base):
     /api/v1/agent/monitoring/batch, отдельный от протокола заданий печати,
     см. docs/PRINTER_MONITORING_FORECASTING.md). Курсор по id для
     health/counter/supply (только INSERT, id монотонно растёт) и по
-    updated_at для алертов (они ещё и обновляются при resolve, не только
-    создаются)."""
+    (updated_at, id) для алертов (они ещё и обновляются при resolve, не
+    только создаются) — СОСТАВНОЙ курсор, а не только updated_at: несколько
+    алертов могут получить одинаковый updated_at (один и тот же опрос
+    обновляет/создаёт несколько строк практически в одну и ту же
+    метку времени), и при limit меньше числа таких строк курсор по одному
+    updated_at продвинулся бы мимо ещё не отправленных строк с тем же
+    значением — они потерялись бы навсегда (следующий запрос отфильтровал
+    бы их условием `updated_at > cursor`)."""
 
     __tablename__ = "monitoring_sync_state"
 
@@ -183,6 +189,10 @@ class MonitoringSyncState(Base):
     last_counter_sample_id = Column(Integer, nullable=False, default=0)
     last_supply_sample_id = Column(Integer, nullable=False, default=0)
     last_alert_synced_at = Column(DateTime, nullable=True)
+    # Часть составного курсора алертов -- см. docstring класса. 0 -- «ещё
+    # ничего не отправлено с этим updated_at», безопасно совпадает с тем,
+    # что last_alert_synced_at тоже None при первой синхронизации.
+    last_alert_synced_id = Column(Integer, nullable=False, default=0)
     last_attempt_at = Column(DateTime, nullable=True)
     last_success_at = Column(DateTime, nullable=True)
     last_error = Column(Text, nullable=True)
@@ -577,10 +587,18 @@ class OutboxEvent(Base):
 
 class SnmpProfile(Base):
     """Переиспользуемый набор OID для одного семейства/модели принтеров
-    (Printer-MIB как база + vendor-specific OID поверх). Community/учётные
-    данные SNMPv3 сюда НЕ входят — только ИМЯ переменной окружения, где они
-    реально лежат (см. printaudit.monitoring.snmp_adapter); секреты никогда
-    не хранятся в БД в открытом виде."""
+    (Printer-MIB как база + vendor-specific OID поверх). Секреты (SNMPv2c
+    community, SNMPv3 auth/priv passphrase) сюда НЕ входят — только ИМЯ
+    переменной окружения, где они реально лежат (см.
+    printaudit.monitoring.snmp_adapter.resolve_snmp_security); секреты
+    никогда не хранятся в БД в открытом виде.
+
+    `snmp_version="v3"` (по умолчанию) — используется `snmp_v3_*`
+    (username всегда обязателен; auth/priv — опциональны, но priv без auth
+    невозможен в USM). `snmp_version="v2c"` — явный legacy-режим для
+    принтеров, не поддерживающих v3 (используется `credentials_env_var`,
+    ТОЛЬКО в этом режиме); это осознанный выбор администратора конкретного
+    профиля, не тихий дефолт всего приложения."""
 
     __tablename__ = "snmp_profiles"
 
@@ -590,9 +608,20 @@ class SnmpProfile(Base):
     # SNMPv3 предпочтителен; "v2c" оставлен для принтеров, которые его не
     # поддерживают (осознанный выбор администратора, не дефолт).
     snmp_version = Column(String(10), nullable=False, default="v3")
-    # Имя переменной(ых) окружения с реальными credentials, например
-    # "SNMP_CRED_HP_LASERJET" -> см. .env.example. НЕ сам секрет.
+    # ТОЛЬКО для snmp_version="v2c": имя переменной окружения с community,
+    # например "SNMP_CRED_HP_LASERJET" -> см. .env.example. НЕ сам секрет.
     credentials_env_var = Column(String(200), nullable=True)
+    # ТОЛЬКО для snmp_version="v3" (USM). username — не секрет, хранится в
+    # БД как есть. auth/priv protocol — имя алгоритма ("SHA"/"SHA256"/... и
+    # "AES"/"AES256"/... соответственно), сама passphrase — ТОЛЬКО через
+    # переменную окружения, имя которой в *_key_env_var. noAuthNoPriv —
+    # оба protocol/key_env_var пусты; authNoPriv — заполнен только auth_*;
+    # authPriv — заполнены оба.
+    snmp_v3_username = Column(String(200), nullable=True)
+    snmp_v3_auth_protocol = Column(String(20), nullable=True)
+    snmp_v3_auth_key_env_var = Column(String(200), nullable=True)
+    snmp_v3_priv_protocol = Column(String(20), nullable=True)
+    snmp_v3_priv_key_env_var = Column(String(200), nullable=True)
     port = Column(Integer, nullable=False, default=161)
     timeout_seconds = Column(Float, nullable=False, default=2.0)
     retries = Column(Integer, nullable=False, default=1)

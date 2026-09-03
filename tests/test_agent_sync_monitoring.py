@@ -1,7 +1,9 @@
 """Тесты синхронизации мониторинговых данных площадка -> центр
 (collector/agent_sync.py::sync_monitoring_data): курсоры двигаются только
-после успеха, отсутствие новых данных — no-op без сетевого вызова, сбой
-сети не двигает курсор (повтор в следующем запуске)."""
+после успеха (в т.ч. НЕ двигаются при partial reject — см. регрессионный
+тест ниже), отсутствие новых данных — no-op без сетевого вызова, сбой сети
+не двигает курсор (повтор в следующем запуске), составной курсор алертов
+устойчив к одинаковому updated_at у нескольких строк."""
 from datetime import datetime, timezone
 
 
@@ -161,6 +163,130 @@ def test_sync_network_failure_does_not_advance_cursor(app_env, monkeypatch):
         assert state.last_error is not None
     finally:
         session.close()
+
+
+def test_sync_partial_reject_does_not_advance_cursor_and_retries_next_run(app_env, monkeypatch):
+    """Регрессия: central вернул HTTP 200 с rejected=1 -- ни один курсор не
+    должен продвинуться (нет per-item ack'ов у /monitoring/batch, поэтому
+    невозможно узнать, какой именно элемент отклонён; если бы курсор
+    продвинулся, отклонённый элемент был бы потерян навсегда). Следующий
+    запуск отправляет ТОТ ЖЕ пакет целиком повторно; когда central
+    подтверждает rejected=0, курсор наконец продвигается."""
+    _enable_agent_mode(monkeypatch)
+    import collector.agent_sync as agent_sync
+    from printaudit.config import get_settings
+    from printaudit.database import SessionLocal
+    from printaudit.models import MonitoringSyncState
+
+    session = SessionLocal()
+    site_id, device_uuid = _make_device_with_health_sample(session)
+    session.close()
+
+    calls = []
+
+    def _fake_send(client, base_url, token, timeout, payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            return {
+                "devices_upserted": 1, "health_accepted": 0, "health_duplicates": 0,
+                "counter_accepted": 0, "counter_duplicates": 0, "supply_accepted": 0, "supply_duplicates": 0,
+                "alerts_accepted": 0, "rejected": 1,
+            }
+        # Повтор: центр идемпотентно определяет ту же строку как duplicate.
+        return {
+            "devices_upserted": 1, "health_accepted": 0, "health_duplicates": 1,
+            "counter_accepted": 0, "counter_duplicates": 0, "supply_accepted": 0, "supply_duplicates": 0,
+            "alerts_accepted": 0, "rejected": 0,
+        }
+
+    monkeypatch.setattr(agent_sync, "send_monitoring_batch", _fake_send)
+
+    settings = get_settings()
+    log = agent_sync.setup_logging(settings.log_dir)
+
+    session = SessionLocal()
+    agent_sync.sync_monitoring_data(session, agent_sync.get_agent_settings(), settings, log)
+    session.close()
+
+    session = SessionLocal()
+    try:
+        state = session.get(MonitoringSyncState, site_id)
+        assert state.last_health_sample_id == 0  # курсор НЕ продвинут
+        assert state.last_success_at is None
+        assert state.last_error is not None and "1" in state.last_error
+    finally:
+        session.close()
+
+    session = SessionLocal()
+    agent_sync.sync_monitoring_data(session, agent_sync.get_agent_settings(), settings, log)
+    session.close()
+
+    assert len(calls) == 2
+    # Второй вызов отправил ТУ ЖЕ строку повторно (курсор не сдвинулся).
+    assert calls[0]["health_samples"][0]["device_uuid"] == device_uuid
+    assert calls[1]["health_samples"][0]["device_uuid"] == device_uuid
+
+    session = SessionLocal()
+    try:
+        state = session.get(MonitoringSyncState, site_id)
+        assert state.last_health_sample_id > 0  # теперь продвинут
+        assert state.last_success_at is not None
+        assert state.last_error is None
+    finally:
+        session.close()
+
+
+def test_alert_cursor_survives_multiple_alerts_with_identical_updated_at(app_env):
+    """Регрессия: несколько алертов с ОДИНАКОВЫМ updated_at и limit меньше
+    их числа -- курсор по одному updated_at пропустил бы навсегда те
+    строки, что не попали в первую "страницу". Составной курсор
+    (updated_at, id) должен доставить все строки без пропусков и без
+    дублей за несколько вызовов _build_monitoring_payload."""
+    import collector.agent_sync as agent_sync
+    from printaudit.database import SessionLocal
+    from printaudit.models import AppUser, MonitoringSyncState, PrinterAlert
+    from printaudit.monitoring.devices import create_device
+    from printaudit.sites import get_or_create_local_print_server
+
+    session = SessionLocal()
+    local_server = get_or_create_local_print_server(session)
+    site = local_server.site
+    actor = AppUser(login_normalized="domain\\actor", role="admin", is_active=True)
+    session.add(actor)
+    session.flush()
+    device = create_device(session, actor=actor, site_id=site.id, display_name="D1")
+    session.flush()
+
+    same_ts = datetime(2026, 9, 5, 12, 0, 0)
+    for i in range(5):
+        alert = PrinterAlert(
+            printer_device_id=device.id, source="direct_snmp", alert_type=f"type_{i}",
+            severity="warning", opened_at=same_ts, external_id=f"type_{i}",
+        )
+        session.add(alert)
+        session.flush()
+        alert.updated_at = same_ts  # форсируем идентичный updated_at у всех строк
+        session.flush()
+    session.commit()
+
+    state = MonitoringSyncState(site_id=site.id)
+    session.add(state)
+    session.flush()
+
+    seen_types = []
+    for _ in range(10):  # с запасом -- должно хватить 3 страниц по 2
+        built = agent_sync._build_monitoring_payload(session, site, state, limit=2)
+        if built is None:
+            break
+        body, cursors = built
+        assert body["alerts"], "пустая страница при built is not None -- баг пагинации"
+        seen_types.extend(a["alert_type"] for a in body["alerts"])
+        state.last_alert_synced_at = cursors["alert_at"]
+        state.last_alert_synced_id = cursors["alert_id"]
+        session.commit()
+
+    session.close()
+    assert sorted(seen_types) == sorted(f"type_{i}" for i in range(5))  # все 5, без пропусков и дублей
 
 
 def test_run_once_does_not_crash_when_monitoring_sync_fails(app_env, monkeypatch):

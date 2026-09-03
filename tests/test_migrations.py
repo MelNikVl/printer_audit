@@ -396,3 +396,83 @@ def test_migrate_copy_of_pre_monitoring_database_to_head(db_env):
 
     with TestClient(main.app):
         pass
+
+
+def test_migrate_copy_of_database_with_old_snmp_and_sync_state_schema_to_head(db_env):
+    """Проверяет две самые новые ревизии (7c9d3e1a5b02 -- SNMPv3 USM-поля
+    snmp_profiles, b4f68a2c9d17 -- составной курсор алертов
+    monitoring_sync_state) на копии БД, уже содержащей СТАРУЮ схему этих
+    двух таблиц (до этого исправления): существующие snmp_profiles/
+    monitoring_sync_state строки не теряются, новые колонки добавляются
+    NULL/0 (не выдуманные значения), идемпотентно, веб открывается."""
+    database, db_path = db_env
+    cfg = _alembic_config()
+    command.upgrade(cfg, "cca38199a688")  # последняя ревизия ДО этого исправления
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO snmp_profiles (name, snmp_version, credentials_env_var, port, timeout_seconds, retries, "
+        "oid_map_json, is_active, created_at, updated_at) "
+        "VALUES ('Legacy-V2C', 'v2c', 'SNMP_CRED_LEGACY', 161, 2.0, 1, '{}', 1, "
+        "'2026-08-01T00:00:00', '2026-08-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO sites (uuid, site_code, name, is_active, created_at) "
+        "VALUES ('s1', 'ALMATY', 'Almaty', 1, '2026-08-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO monitoring_sync_state (site_id, last_health_sample_id, last_counter_sample_id, "
+        "last_supply_sample_id, last_alert_synced_at) VALUES (1, 42, 7, 3, '2026-08-02T00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        profile = conn.execute(
+            "SELECT name, snmp_version, credentials_env_var, snmp_v3_username, snmp_v3_auth_protocol "
+            "FROM snmp_profiles WHERE name = 'Legacy-V2C'"
+        ).fetchone()
+        assert profile == ("Legacy-V2C", "v2c", "SNMP_CRED_LEGACY", None, None)  # старая строка сохранена, новые поля NULL
+
+        state = conn.execute(
+            "SELECT last_health_sample_id, last_counter_sample_id, last_supply_sample_id, "
+            "last_alert_synced_at, last_alert_synced_id FROM monitoring_sync_state WHERE site_id = 1"
+        ).fetchone()
+        assert state == (42, 7, 3, "2026-08-02T00:00:00", 0)  # существующие курсоры целы, новый = 0 (не выдуман)
+
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(snmp_profiles)").fetchall()}
+        assert {"snmp_v3_username", "snmp_v3_auth_protocol", "snmp_v3_auth_key_env_var", "snmp_v3_priv_protocol", "snmp_v3_priv_key_env_var"} <= cols
+    finally:
+        conn.close()
+
+    command.upgrade(cfg, "head")  # идемпотентность
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT count(*) FROM snmp_profiles WHERE name = 'Legacy-V2C'").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM monitoring_sync_state WHERE site_id = 1").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    from sqlalchemy import inspect
+
+    import printaudit.models  # noqa: F401
+
+    insp = inspect(database.engine)
+    model_tables = set(database.Base.metadata.tables.keys())
+    for table in ("snmp_profiles", "monitoring_sync_state"):
+        model_cols = {c.name for c in database.Base.metadata.tables[table].columns}
+        db_cols = {c["name"] for c in insp.get_columns(table)}
+        assert model_cols == db_cols, f"{table}: {model_cols} != {db_cols}"
+
+    import os
+
+    os.environ["SESSION_SECRET_KEY"] = "test-session-secret-not-for-production-" + "x" * 20
+    import webapp.main as main
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app):
+        pass

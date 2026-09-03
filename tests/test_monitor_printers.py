@@ -23,6 +23,19 @@ def _make_device(session, site, actor, source, **kwargs):
     return device
 
 
+def _make_snmp_profile(session, name="test-profile"):
+    """Минимальный ВАЛИДНЫЙ SNMPv3 noAuthNoPriv-профиль -- без него
+    poll_device теперь честно отказывает конфигурационной ошибкой (нет
+    неявного fallback на community='public', см.
+    printaudit/monitoring/snmp_adapter.py::resolve_snmp_security)."""
+    from printaudit.models import SnmpProfile
+
+    profile = SnmpProfile(name=name, snmp_version="v3", snmp_v3_username="monitor-user")
+    session.add(profile)
+    session.flush()
+    return profile
+
+
 def test_only_zabbix_and_snmp_devices_are_polled(app_env, monkeypatch):
     import collector.monitor_printers as mp
     from printaudit.database import SessionLocal
@@ -71,13 +84,14 @@ def test_snmp_devices_polled_with_injected_getter(app_env):
     session = SessionLocal()
     site = get_or_create_site(session, "TEST", name="TEST")
     actor = _make_app_user(session)
+    profile = _make_snmp_profile(session)
     session.commit()
-    device = _make_device(session, site, actor, MONITORING_SOURCE_SNMP)
+    device = _make_device(session, site, actor, MONITORING_SOURCE_SNMP, snmp_profile_id=profile.id)
     device.ip_address = "10.0.0.9"
     session.commit()
     session.close()
 
-    def _fake_getter(host, port, community, oid, timeout, retries):
+    def _fake_getter(host, port, security, oid, timeout, retries):
         if oid == DEFAULT_OIDS["device_status"]:
             return "3"
         return None
@@ -103,16 +117,17 @@ def test_one_failing_device_does_not_stop_the_rest(app_env):
     session = SessionLocal()
     site = get_or_create_site(session, "TEST", name="TEST")
     actor = _make_app_user(session)
+    profile = _make_snmp_profile(session)
     session.commit()
-    good = _make_device(session, site, actor, MONITORING_SOURCE_SNMP, display_name="Good")
+    good = _make_device(session, site, actor, MONITORING_SOURCE_SNMP, display_name="Good", snmp_profile_id=profile.id)
     good.ip_address = "10.0.0.1"
-    bad = _make_device(session, site, actor, MONITORING_SOURCE_SNMP, display_name="Bad")
+    bad = _make_device(session, site, actor, MONITORING_SOURCE_SNMP, display_name="Bad", snmp_profile_id=profile.id)
     bad.ip_address = "10.0.0.2"
     session.commit()
     bad_id = bad.id
     session.close()
 
-    def _fake_getter(host, port, community, oid, timeout, retries):
+    def _fake_getter(host, port, security, oid, timeout, retries):
         if host == "10.0.0.2":
             raise RuntimeError("boom")
         if oid == DEFAULT_OIDS["device_status"]:
@@ -128,6 +143,50 @@ def test_one_failing_device_does_not_stop_the_rest(app_env):
         # "bad" ещё и timeout'ится на самом статусе -> is_reachable=False,
         # но это не то же самое, что провал ВСЕГО прогона -- прогон
         # завершается success, просто для этого устройства всё unknown.
+        assert run.status == "success"
+    finally:
+        session.close()
+
+
+def test_device_with_unconfigured_snmp_profile_does_not_crash_the_run(app_env):
+    """Регрессия: устройство без назначенного SnmpProfile (или с неполным
+    профилем) теперь честно проваливает СВОЙ опрос с SnmpConfigError (нет
+    неявного fallback на community='public', см.
+    printaudit/monitoring/snmp_adapter.py). Это раньше обнажало отдельный
+    баг: session.rollback() после сбоя устройства откатывал и ещё не
+    закоммиченную строку MonitoringRun (она была только flush'нута), из-за
+    чего сам прогон падал с AttributeError вместо честного devices_failed=1."""
+    import collector.monitor_printers as mp
+    from printaudit.database import SessionLocal
+    from printaudit.models import MonitoringRun
+    from printaudit.monitoring.snmp_adapter import DEFAULT_OIDS
+    from printaudit.sites import get_or_create_site
+
+    session = SessionLocal()
+    site = get_or_create_site(session, "TEST", name="TEST")
+    actor = _make_app_user(session)
+    profile = _make_snmp_profile(session)
+    session.commit()
+    good = _make_device(session, site, actor, MONITORING_SOURCE_SNMP, display_name="Good", snmp_profile_id=profile.id)
+    good.ip_address = "10.0.0.1"
+    unconfigured = _make_device(session, site, actor, MONITORING_SOURCE_SNMP, display_name="Unconfigured")
+    unconfigured.ip_address = "10.0.0.3"  # monitoring_source=direct_snmp, но snmp_profile_id не задан
+    session.commit()
+    session.close()
+
+    def _fake_getter(host, port, security, oid, timeout, retries):
+        if oid == DEFAULT_OIDS["device_status"]:
+            return "3"
+        return None
+
+    mp.run_once(snmp_getter=_fake_getter)  # не должно бросить исключение
+
+    session = SessionLocal()
+    try:
+        run = session.query(MonitoringRun).filter_by(source=MONITORING_SOURCE_SNMP).one()
+        assert run.devices_polled == 2
+        assert run.devices_ok == 1
+        assert run.devices_failed == 1
         assert run.status == "success"
     finally:
         session.close()
