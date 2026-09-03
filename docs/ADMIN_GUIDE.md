@@ -349,6 +349,8 @@ UPN — чтобы в одном файле не было двух разных 
   разные отделы) показывается явно, а не решается тихо.
 - **Принтеры** — см. раздел 5.
 - **Тарифы** — см. раздел 13.
+- **Endpoint-агенты** *(на сервере площадки, не на центральном)* — регистрация/
+  ротация токена/отключение endpoint-агентов пользовательских ПК, см. раздел 23.
 
 ### Ручное назначение отдела (`lock`)
 
@@ -546,3 +548,55 @@ Server из этой страницы **не реализовано** — это
    через 1-2 минуты проверить `logs/collector.log` и `logs/agent_sync.log`,
    затем убедиться, что задание появилось в центральном `/print-jobs` с
    правильной площадкой/сервером.
+
+## 22. Мониторинг физических принтеров
+
+Полная архитектура — в
+[docs/PRINTER_MONITORING_FORECASTING.md](PRINTER_MONITORING_FORECASTING.md).
+Кратко, для эксплуатации:
+
+1. Заведите устройство (`PrinterDevice`) и свяжите с нужными очередями —
+   это делается в коде через `printaudit.monitoring.devices` (отдельного
+   UI для этого шага в MVP нет, см. пункт "Дальше" в ROADMAP); свяжите
+   `snmp_profile_id`/`zabbix_host_id` через ту же функцию.
+2. Выберите источник: `zabbix_api` (если площадка уже мониторится
+   Zabbix — заполните `ZABBIX_API_URL`/`ZABBIX_API_TOKEN` в `.env`,
+   API-токен с правами только на чтение) или `direct_snmp` (заполните
+   SNMP-профиль, credentials — тоже через `.env`, SNMPv3 предпочтителен).
+3. Зарегистрируйте задачу опроса (по умолчанию каждые 5 минут):
+   ```powershell
+   .\deploy\register_monitor_printers_task.ps1
+   ```
+4. Зарегистрируйте ежедневный retention (агрегация расходников + очистка
+   старых сырых сэмплов/решённых алертов):
+   ```powershell
+   .\deploy\register_monitoring_retention_task.ps1
+   ```
+5. Проверить: `/printers` показывает устройство со статусом, отличным от
+   `unknown`, после первого успешного опроса; лог —
+   `logs/monitor_printers.log`.
+
+## 23. Endpoint-агент (USB / прямая печать на ПК пользователя)
+
+1. На сервере площадки (standalone или agent-режим) откройте
+   `/admin/endpoint-agents`, укажите имя компьютера, зарегистрируйте —
+   `ENDPOINT_UUID` и `ENDPOINT_TOKEN` показываются один раз, скопируйте оба.
+2. На целевом ПК — скопируйте каталог `endpoint_agent/`, заполните
+   `endpoint_agent.env` (на основе `endpoint_agent.env.example`) значениями
+   из шага 1 и адресом сервера площадки, затем:
+   ```powershell
+   .\deploy\install_endpoint_agent.ps1
+   ```
+   Ставит службу Windows `PrintAuditEndpointAgent` (работает без открытого
+   окна, автозапуск). Для массового развёртывания на много ПК — через GPO/
+   подписанный MSI, см. раздел 7 в
+   [docs/PRINTER_MONITORING_FORECASTING.md](PRINTER_MONITORING_FORECASTING.md).
+3. Проверить: `Get-Service PrintAuditEndpointAgent` на целевом ПК; после
+   печати на USB/прямом IP-принтере — `logs/endpoint_agent.log`, задание
+   должно появиться в `/print-jobs` площадки с заполненным `Компьютер` и
+   пустым Print Server.
+4. Если печать на ПК идёт через сетевую очередь Print Server (не
+   USB/WSD/прямой IP) — endpoint-агент её намеренно НЕ учитывает (иначе
+   задвоение с самим Print Server, см. раздел 7 в
+   [docs/PRINTER_MONITORING_FORECASTING.md](PRINTER_MONITORING_FORECASTING.md)).
+   Это ожидаемое поведение, не ошибка агента.

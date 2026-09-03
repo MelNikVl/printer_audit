@@ -1,8 +1,12 @@
 # Print Audit — учёт печати на Windows Print Server с AD-авторизацией
 
-Аналог MyQ для нескольких объектов. Учёт идёт на уровне **Windows Print
-Server Event Log**, а не устройства — работает с любыми принтерами (HP,
-Kyocera, Canon и т.д.), пока печать проходит через очереди печати сервера.
+Аналог MyQ для нескольких объектов. Учёт заданий печати идёт на уровне
+**Windows Print Server Event Log**, а не устройства — работает с любыми
+принтерами (HP, Kyocera, Canon и т.д.), пока печать проходит через очереди
+печати сервера; USB/прямые IP-принтеры на пользовательских ПК учитываются
+отдельным endpoint-агентом (см. ниже). Опционально поверх этого — техническое
+состояние физических принтеров (доступность, расходники, ошибки — через
+Zabbix или прямой SNMP) и прогнозирование нагрузки/расходников/простоя.
 Доступ к отчётам и админке — через локальные учётки и/или Active Directory
 (оба независимо опциональны), с ролями `superadmin` / `admin` / `viewer`.
 
@@ -18,7 +22,10 @@ Kyocera, Canon и т.д.), пока печать проходит через о�
 рассматривались и почему выбран этот стек), [docs/ADMIN_GUIDE.md](docs/ADMIN_GUIDE.md)
 (эксплуатация: AD, миграции, принтеры, тарифы, бэкап), [docs/ROADMAP.md](docs/ROADMAP.md)
 (развитие после пилота), [docs/MULTISITE_ARCHITECTURE.md](docs/MULTISITE_ARCHITECTURE.md)
-(режимы standalone/agent/central, гарантии доставки, идемпотентность).
+(режимы standalone/agent/central, гарантии доставки, идемпотентность),
+[docs/PRINTER_MONITORING_FORECASTING.md](docs/PRINTER_MONITORING_FORECASTING.md)
+(мониторинг физических принтеров, endpoint-агент для USB/прямой печати,
+прогнозирование нагрузки/расходников/простоя).
 
 ## Архитектура
 
@@ -210,6 +217,31 @@ python scripts\bootstrap_superadmin.py --login "DOMAIN\ivanov"
    ```
 4. Подробности, гарантии доставки при обрыве связи и ограничения MVP — в
    [docs/MULTISITE_ARCHITECTURE.md](docs/MULTISITE_ARCHITECTURE.md).
+
+## Мониторинг принтеров, USB-печать, прогнозирование (опционально)
+
+Тоже необязательная надстройка — без неё всё выше работает как раньше.
+
+- **Техническое состояние устройств** (`/printers`, `/printers/{id}`,
+  карточки на `/admin`): подключите принтеры к Zabbix (если уже есть на
+  площадке) или настройте прямой SNMP-опрос — `.env`
+  (`ZABBIX_API_URL`/`ZABBIX_API_TOKEN` или SNMP-профиль), заведите
+  `PrinterDevice` и свяжите с очередями в админке, зарегистрируйте задачу
+  опроса: `.\deploy\register_monitor_printers_task.ps1`.
+- **USB/прямая печать на пользовательских ПК**: зарегистрируйте компьютер
+  в `/admin/endpoint-agents` на сервере площадки, установите endpoint-агент
+  как службу Windows: `.\deploy\install_endpoint_agent.ps1` (см.
+  `endpoint_agent/endpoint_agent.env.example`). Для развёртывания на много
+  ПК сразу — через GPO/подписанный MSI, см. раздел 7 в
+  [docs/PRINTER_MONITORING_FORECASTING.md](docs/PRINTER_MONITORING_FORECASTING.md).
+- **Прогнозы** (нагрузка/расходники/риск простоя, на карточке устройства):
+  считаются по расписанию, а не на каждый просмотр страницы:
+  `.\deploy\register_compute_forecasts_task.ps1`.
+- Retention сырых мониторинговых данных: `.\deploy\register_monitoring_retention_task.ps1`.
+
+Полная архитектура, форматы данных, минимальные требования к истории для
+прогноза и т.д. — в
+[docs/PRINTER_MONITORING_FORECASTING.md](docs/PRINTER_MONITORING_FORECASTING.md).
 
 ## Обновление уже развёрнутого сервера
 

@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ЧЕСТНО ЗАДОКУМЕНТИРОВАННЫЙ СКАФФОЛД, а не готовый к сборке пакет.
+
+  Сборка подписанного MSI требует WiX Toolset (candle.exe/light.exe, или
+  `dotnet build` с WiX v4 SDK) и сертификата подписи кода организации
+  (signtool.exe) — ни того, ни другого нет в этом окружении, поэтому файл
+  не проверен реальной сборкой. Считайте его отправной точкой для команды,
+  у которой есть WiX/сертификат, а не финальным артефактом.
+
+  Что должен делать реальный пакет (см. deploy/install_endpoint_agent.ps1
+  за эквивалентной логикой без MSI):
+    1. Скопировать каталог endpoint_agent\ (код + requirements.txt) и
+       используемый Python-интерпретатор (embeddable Python или venv,
+       см. комментарий ниже) в %ProgramFiles%\PrintAudit\EndpointAgent\.
+    2. НЕ включать endpoint_agent.env с реальным токеном в MSI — токен
+       уникален для каждого ПК (регистрируется в /admin/endpoint-agents
+       на сервере площадки) и не должен лежать в одном .msi, который
+       ставится на много машин через GPO. Вместо этого:
+         - CustomAction записывает пустой/шаблонный endpoint_agent.env, а
+           заполнение ENDPOINT_UUID/ENDPOINT_TOKEN — отдельным шагом
+           (например, самостоятельным скриптом синхронизации из внутренней
+           системы выдачи секретов, GPO Group Policy Preferences файл per-OU,
+           или просто ручной операцией на пилотных машинах);
+         - либо более простой путь для небольших внедрений: MSI
+           разворачивает только код+зависимости, конфигурацию заполняет
+           deploy\install_endpoint_agent.ps1 отдельно (см. его docstring).
+    3. ServiceInstall/ServiceControl регистрирует и запускает
+       PrintAuditEndpointAgent (endpoint_agent/service.py) как службу
+       LocalSystem с автозапуском — WiX ServiceInstall не может напрямую
+       вызвать `python service.py install`, поэтому реалистичный вариант:
+       упаковать endpoint_agent через PyInstaller в один .exe (см.
+       комментарий "Python runtime" ниже) и завести ServiceInstall на
+       него напрямую (Type="ownProcess", Start="auto").
+
+  Python runtime: pywin32 (единственная зависимость, см.
+  endpoint_agent/requirements.txt) делает "просто скопировать embeddable
+  Python" нетривиальным (pywin32 требует post-install шаг pywin32_postinstall.py
+  для регистрации COM/pythonservice.exe). Более простой и надёжный путь для
+  production — собрать endpoint_agent через PyInstaller
+  (`pyinstaller --onefile endpoint_agent/service.py`) в
+  PrintAuditEndpointAgent.exe и упаковывать уже готовый .exe в MSI — тогда
+  Candle/Light ничего не знают про Python вообще. Эта команда тоже НЕ
+  выполнялась в данном окружении (PyInstaller здесь не установлен) — см.
+  docs/PRINTER_MONITORING_FORECASTING.md, раздел про сборку endpoint-агента.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Print Audit Endpoint Agent"
+           Manufacturer="YOUR ORGANIZATION"
+           Version="1.0.0.0"
+           UpgradeCode="PUT-A-STABLE-GUID-HERE-00000000"
+           Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="Установлена более новая версия Print Audit Endpoint Agent." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="PrintAudit">
+        <Directory Id="AGENTFOLDER" Name="EndpointAgent" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="EndpointAgentComponents" Directory="AGENTFOLDER">
+      <Component Id="EndpointAgentExe" Guid="PUT-A-STABLE-GUID-HERE-00000001">
+        <!-- Собранный PyInstaller-бинарник (см. комментарий выше), НЕ
+             python.exe + .py файлы напрямую -- ServiceInstall ниже
+             ссылается на этот файл как на исполняемый файл службы. -->
+        <File Id="EndpointAgentExeFile" Source="dist\PrintAuditEndpointAgent.exe" KeyPath="yes" />
+
+        <ServiceInstall
+          Id="PrintAuditEndpointAgentService"
+          Name="PrintAuditEndpointAgent"
+          DisplayName="Print Audit Endpoint Agent"
+          Description="Учитывает печать через USB/WSD/прямые IP-принтеры этого ПК для Print Audit. Не собирает содержимое документов."
+          Type="ownProcess"
+          Start="auto"
+          Account="LocalSystem"
+          ErrorControl="normal" />
+        <ServiceControl
+          Id="PrintAuditEndpointAgentServiceControl"
+          Name="PrintAuditEndpointAgent"
+          Start="install"
+          Stop="both"
+          Remove="uninstall" />
+      </Component>
+
+      <!-- Шаблон конфигурации БЕЗ токена -- см. комментарий вверху файла
+           про то, почему реальный ENDPOINT_TOKEN не должен ехать внутри MSI. -->
+      <Component Id="EndpointAgentEnvExample" Guid="PUT-A-STABLE-GUID-HERE-00000002">
+        <File Id="EndpointAgentEnvExampleFile" Source="..\endpoint_agent\endpoint_agent.env.example"
+              Name="endpoint_agent.env.example" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Print Audit Endpoint Agent" Level="1">
+      <ComponentGroupRef Id="EndpointAgentComponents" />
+    </Feature>
+  </Package>
+</Wix>
