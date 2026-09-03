@@ -40,10 +40,12 @@ from printaudit.models import (
     PrintJob,
     PrintServer,
     Site,
+    SnmpProfile,
     SyncRun,
 )
 from printaudit.models import User as LegacyUser
 from printaudit.monitoring.device_queries import dashboard_summary
+from printaudit.monitoring.snmp_profiles import SnmpProfileError, create_snmp_profile, set_snmp_profile_active, update_snmp_profile
 from printaudit.printers.discovery import PrinterDiscoveryError, sync_printer_queues
 from printaudit.printers.resolver import resolve_price
 from printaudit.security.agent_tokens import generate_agent_token, hash_agent_token
@@ -1155,3 +1157,115 @@ def admin_endpoint_agents_enable(
     )
     db.commit()
     return _redirect("/admin/endpoint-agents", msg=f"«{agent.hostname}» включён")
+
+
+# ---------------------------------------------------------------------------
+# Профили SNMP (см. printaudit.monitoring.snmp_adapter, docs/PRINTER_MONITORING_FORECASTING.md)
+# ---------------------------------------------------------------------------
+
+
+def _snmp_profile_form_kwargs(
+    name: str, description: str, snmp_version: str, port: int, timeout_seconds: float, retries: int,
+    oid_map_json: str, credentials_env_var: str, snmp_v3_username: str, snmp_v3_auth_protocol: str,
+    snmp_v3_auth_key_env_var: str, snmp_v3_priv_protocol: str, snmp_v3_priv_key_env_var: str,
+) -> dict:
+    return dict(
+        name=name, description=description, snmp_version=snmp_version, port=port, timeout_seconds=timeout_seconds,
+        retries=retries, oid_map_json=oid_map_json, credentials_env_var=credentials_env_var or None,
+        snmp_v3_username=snmp_v3_username or None, snmp_v3_auth_protocol=snmp_v3_auth_protocol or None,
+        snmp_v3_auth_key_env_var=snmp_v3_auth_key_env_var or None, snmp_v3_priv_protocol=snmp_v3_priv_protocol or None,
+        snmp_v3_priv_key_env_var=snmp_v3_priv_key_env_var or None,
+    )
+
+
+@router.get("/snmp-profiles")
+def admin_snmp_profiles(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    profiles = db.query(SnmpProfile).order_by(SnmpProfile.name).all()
+    return templates.TemplateResponse(
+        "admin/snmp_profiles.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "profiles": profiles,
+        },
+    )
+
+
+@router.post("/snmp-profiles/create", dependencies=[Depends(require_csrf)])
+def admin_snmp_profiles_create(
+    request: Request,
+    name: str = Form(...), description: str = Form(""), snmp_version: str = Form("v3"),
+    port: int = Form(161), timeout_seconds: float = Form(2.0), retries: int = Form(1),
+    oid_map_json: str = Form("{}"), credentials_env_var: str = Form(""),
+    snmp_v3_username: str = Form(""), snmp_v3_auth_protocol: str = Form(""),
+    snmp_v3_auth_key_env_var: str = Form(""), snmp_v3_priv_protocol: str = Form(""),
+    snmp_v3_priv_key_env_var: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    kwargs = _snmp_profile_form_kwargs(
+        name, description, snmp_version, port, timeout_seconds, retries, oid_map_json, credentials_env_var,
+        snmp_v3_username, snmp_v3_auth_protocol, snmp_v3_auth_key_env_var, snmp_v3_priv_protocol,
+        snmp_v3_priv_key_env_var,
+    )
+    try:
+        profile = create_snmp_profile(db, actor=current_user, **kwargs)
+    except SnmpProfileError as exc:
+        db.rollback()
+        return _redirect("/admin/snmp-profiles", err=str(exc))
+    db.commit()
+    return _redirect("/admin/snmp-profiles", msg=f"Профиль SNMP «{profile.name}» создан")
+
+
+@router.post("/snmp-profiles/{profile_id}/update", dependencies=[Depends(require_csrf)])
+def admin_snmp_profiles_update(
+    profile_id: int, request: Request,
+    name: str = Form(...), description: str = Form(""), snmp_version: str = Form("v3"),
+    port: int = Form(161), timeout_seconds: float = Form(2.0), retries: int = Form(1),
+    oid_map_json: str = Form("{}"), credentials_env_var: str = Form(""),
+    snmp_v3_username: str = Form(""), snmp_v3_auth_protocol: str = Form(""),
+    snmp_v3_auth_key_env_var: str = Form(""), snmp_v3_priv_protocol: str = Form(""),
+    snmp_v3_priv_key_env_var: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    profile = db.get(SnmpProfile, profile_id)
+    if profile is None:
+        return _redirect("/admin/snmp-profiles", err="Профиль SNMP не найден")
+    kwargs = _snmp_profile_form_kwargs(
+        name, description, snmp_version, port, timeout_seconds, retries, oid_map_json, credentials_env_var,
+        snmp_v3_username, snmp_v3_auth_protocol, snmp_v3_auth_key_env_var, snmp_v3_priv_protocol,
+        snmp_v3_priv_key_env_var,
+    )
+    try:
+        update_snmp_profile(db, actor=current_user, profile=profile, **kwargs)
+    except SnmpProfileError as exc:
+        db.rollback()
+        return _redirect("/admin/snmp-profiles", err=str(exc))
+    db.commit()
+    return _redirect("/admin/snmp-profiles", msg=f"Профиль SNMP «{profile.name}» обновлён")
+
+
+@router.post("/snmp-profiles/{profile_id}/disable", dependencies=[Depends(require_csrf)])
+def admin_snmp_profiles_disable(
+    profile_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    profile = db.get(SnmpProfile, profile_id)
+    if profile is None:
+        return _redirect("/admin/snmp-profiles", err="Профиль SNMP не найден")
+    set_snmp_profile_active(db, actor=current_user, profile=profile, is_active=False)
+    db.commit()
+    return _redirect("/admin/snmp-profiles", msg=f"Профиль SNMP «{profile.name}» отключён")
+
+
+@router.post("/snmp-profiles/{profile_id}/enable", dependencies=[Depends(require_csrf)])
+def admin_snmp_profiles_enable(
+    profile_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    profile = db.get(SnmpProfile, profile_id)
+    if profile is None:
+        return _redirect("/admin/snmp-profiles", err="Профиль SNMP не найден")
+    set_snmp_profile_active(db, actor=current_user, profile=profile, is_active=True)
+    db.commit()
+    return _redirect("/admin/snmp-profiles", msg=f"Профиль SNMP «{profile.name}» включён")
