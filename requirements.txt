@@ -13,3 +13,8 @@ httpx==0.27.2
 
 # Опционально, только если БД = PostgreSQL (см. config/config.yaml -> db.url)
 # psycopg2-binary==2.9.9
+
+# Опционально, только если на площадке используется monitoring_source=direct_snmp
+# (см. docs/PRINTER_MONITORING_FORECASTING.md, printaudit/monitoring/snmp_adapter.py) —
+# для zabbix_api эта зависимость не нужна вообще, там только httpx (уже выше).
+# pysnmp==6.2.6
