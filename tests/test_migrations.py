@@ -53,7 +53,7 @@ CREATE TABLE print_jobs (
     price_per_page FLOAT,
     cost FLOAT,
     created_at DATETIME NOT NULL,
-    UNIQUE(site_code, record_id)
+    CONSTRAINT uq_print_jobs_site_record UNIQUE(site_code, record_id)
 );
 CREATE TABLE collector_state (
     site_code VARCHAR(50) PRIMARY KEY,

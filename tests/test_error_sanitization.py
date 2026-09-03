@@ -165,7 +165,7 @@ def test_printer_discovery_error_does_not_leak_to_redirect(http_client, monkeypa
     import webapp.admin_routes as admin_routes
     from printaudit.printers.discovery import PrinterDiscoveryError
 
-    def _fail(db, fetch_fn=None):
+    def _fail(db, fetch_fn=None, print_server_id=None):
         raise PrinterDiscoveryError(f"Export-Printers.ps1 failed: {SENSITIVE_DETAIL}")
 
     monkeypatch.setattr(admin_routes, "sync_printer_queues", _fail)

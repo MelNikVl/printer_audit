@@ -14,12 +14,20 @@ deploy/register_collector_task.ps1). Каждый запуск:
 
 Идемпотентность: курсор (EventRecordID) не позволяет обработать событие дважды
 при штатной работе; на случай повторного запуска/сбоя после частичной вставки
-дополнительно стоит UNIQUE(site_code, record_id) на уровне БД и проверка
-существования записи перед вставкой. Курсор продвигается и sync_runs
-помечается success только если весь прогон дошёл до конца без исключения —
-при сбое пишется отдельная запись sync_runs со status="failed" в отдельной
-транзакции (см. _record_failed_run), потому что основная транзакция в этот
-момент уже откатывается.
+дополнительно стоит UNIQUE(print_server_id, record_id) на уровне БД (см.
+printaudit.models.PrintJob — EventRecordID уникален только в пределах одного
+Print Server, не площадки) и проверка существования записи перед вставкой.
+Курсор продвигается и sync_runs помечается success только если весь прогон
+дошёл до конца без исключения — при сбое пишется отдельная запись sync_runs
+со status="failed" в отдельной транзакции (см. _record_failed_run), потому что
+основная транзакция в этот момент уже откатывается.
+
+Multisite (см. docs/MULTISITE_ARCHITECTURE.md): каждый запуск сам заводит
+себе локальный Site+PrintServer (printaudit.sites.get_or_create_local_print_server),
+без ручной регистрации — это то же самое поведение и в standalone-, и в
+agent-режиме. В agent-режиме (APP_MODE=agent) каждое новое задание СРАЗУ
+ставится в durable outbox (OutboxEvent) в ТОЙ ЖЕ транзакции — см.
+scripts/agent_sync.py, который отдельно и периодически отправляет очередь в центр.
 """
 import argparse
 import json
@@ -33,12 +41,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from printaudit.ad_normalize import normalize_login  # noqa: E402
 from printaudit.ad_settings import get_ad_settings  # noqa: E402
+from printaudit.agent_settings import is_agent_mode  # noqa: E402
 from printaudit.config import get_settings  # noqa: E402
 from printaudit.database import SessionLocal  # noqa: E402
 from printaudit.department_resolver import lookup_department_for_print_job_user  # noqa: E402
-from printaudit.models import CollectorState, PrintJob, SyncRun  # noqa: E402
+from printaudit.models import CollectorState, OutboxEvent, PrintJob, SyncRun  # noqa: E402
 from printaudit.printers.resolver import get_or_create_printer_queue, resolve_price  # noqa: E402
 from printaudit.privacy import apply_document_name_policy  # noqa: E402
+from printaudit.sites import get_or_create_local_print_server  # noqa: E402
 
 PS_SCRIPT = Path(__file__).resolve().parent / "Export-PrintEvents.ps1"
 
@@ -191,6 +201,14 @@ def run_once() -> None:
     run_started_at = datetime.now(timezone.utc)
     session = SessionLocal()
     try:
+        # Локальный Print Server ЭТОГО процесса — заводится автоматически
+        # (site_code/server_name из config.yaml), без ручной регистрации.
+        # Нужен и standalone-, и agent-режиму: делает print_jobs.print_server_id
+        # / printer_queues всегда заполненными, что и есть настоящий ключ
+        # идемпотентности теперь (см. printaudit.models.PrintJob).
+        print_server = get_or_create_local_print_server(session, settings)
+        outbox_enabled = is_agent_mode()
+
         state = get_or_create_state(session, settings.site_code)
         events = fetch_events(
             settings.log_name, settings.event_id, state.last_record_id, settings.max_events_per_run
@@ -208,7 +226,7 @@ def run_once() -> None:
 
             existing = (
                 session.query(PrintJob)
-                .filter_by(site_code=settings.site_code, record_id=record_id)
+                .filter_by(print_server_id=print_server.id, record_id=record_id)
                 .first()
             )
             if existing:
@@ -221,6 +239,16 @@ def run_once() -> None:
                 user_name = str(get_field(props, fm, "user_name", "") or "").strip()
                 printer_name = str(get_field(props, fm, "printer_name", "") or "").strip()
                 total_pages = int(get_field(props, fm, "total_pages", 0) or 0)
+                # Необязательные поля — калибруются в field_map ТОЛЬКО если
+                # реально найдены и надёжны на конкретном сервере/драйвере;
+                # если поле не упомянуто в field_map, get_field() возвращает
+                # None без ошибки, и мы не выдумываем значение (см.
+                # docs/MULTISITE_ARCHITECTURE.md про total_pages/copies).
+                source_computer_raw = get_field(props, fm, "source_computer", None)
+                copies_raw = get_field(props, fm, "copies", None)
+                pages_per_copy_raw = get_field(props, fm, "pages_per_copy", None)
+                copies = int(copies_raw) if copies_raw not in (None, "") else None
+                pages_per_copy = int(pages_per_copy_raw) if pages_per_copy_raw not in (None, "") else None
             except (TypeError, ValueError) as exc:
                 log.warning(
                     "RecordId=%s: не удалось разобрать поля (%s). Проверьте калибровку "
@@ -244,7 +272,7 @@ def run_once() -> None:
             # Очередь печати: если её ещё не видела синхронизация Get-Printer
             # (/admin -> Принтеры -> "Обнаружить очереди"), заводим сами как
             # discovered/unconfigured — учёт не блокируется отсутствием ручной настройки.
-            printer_queue = get_or_create_printer_queue(session, printer_name)
+            printer_queue = get_or_create_printer_queue(session, printer_name, print_server.id)
             if not printer_queue.collection_enabled:
                 log.info(
                     "RecordId=%s: учёт для очереди '%s' отключён (collection_enabled=False) — пропущено.",
@@ -254,10 +282,8 @@ def run_once() -> None:
                 continue
             printer_queue.last_job_at = time_created
 
-            price_per_page, is_color, _currency, price_rule_id = resolve_price(
-                session, printer_queue, time_created, settings
-            )
-            cost = round(total_pages * price_per_page, 2)
+            resolution = resolve_price(session, printer_queue, time_created, settings)
+            cost = round(total_pages * resolution.price_per_page, 2)
 
             department_id = lookup_department_for_print_job_user(
                 session, user_name, ad_domain=ad_settings.domain or None
@@ -265,6 +291,8 @@ def run_once() -> None:
 
             job = PrintJob(
                 site_code=settings.site_code,
+                site_id=print_server.site_id,
+                print_server_id=print_server.id,
                 record_id=record_id,
                 job_id=str(job_id) if job_id is not None else None,
                 time_created=time_created,
@@ -272,15 +300,25 @@ def run_once() -> None:
                 user_login_normalized=normalize_login(user_name),
                 document_name=apply_document_name_policy(document_name, settings.document_name_policy),
                 printer_name=printer_name,
+                source_computer=str(source_computer_raw).strip() if source_computer_raw else None,
                 total_pages=total_pages,
-                is_color=is_color,
+                copies=copies,
+                pages_per_copy=pages_per_copy,
+                is_color=resolution.is_color,
+                color_source=resolution.color_source,
                 department_id=department_id,
                 printer_queue_id=printer_queue.id,
-                price_rule_id=price_rule_id,
-                price_per_page=price_per_page,
+                price_rule_id=resolution.price_rule_id,
+                price_per_page=resolution.price_per_page,
+                currency=resolution.currency,
                 cost=cost,
             )
             session.add(job)
+            if outbox_enabled:
+                # Атомарно с самим заданием (та же транзакция/commit) — см.
+                # требование "запись PrintJob и постановка в outbox происходят
+                # атомарно" (docs/MULTISITE_ARCHITECTURE.md, часть 4).
+                session.add(OutboxEvent(print_job=job))
             inserted += 1
 
         state.last_record_id = max_record_id

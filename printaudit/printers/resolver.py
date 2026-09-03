@@ -13,9 +13,25 @@
 Найденная на момент вставки цена (price_per_page, cost) и id сработавшего
 правила (price_rule_id) сохраняются в print_jobs НЕОБРАТИМО — последующее
 изменение/удаление тарифа не пересчитывает уже вставленные задания.
+
+Цветность (is_color) — ВСЕГДА tri-state (True/False/None), НЕ bool с тихим
+дефолтом в False. `color_source` объясняет, откуда взято значение:
+  - "queue"   — из явной настройки очереди/правила/price_list (администратор
+                сам сказал "эта очередь цветная/чёрно-белая");
+  - "event"   — из самого события печати (Event 307 в этом проекте такого
+                свойства НЕ предоставляет, см. docs/RESEARCH.md и
+                docs/MULTISITE_ARCHITECTURE.md — зарезервировано на будущее
+                и для central API, куда агент теоретически может передать
+                более точные данные);
+  - "unknown" — цвет достоверно не определён; is_color=None. Цена для
+                биллинга в этом случае консервативно берётся по Ч/Б тарифу
+                (settings.default_price_bw), но это НЕ то же самое, что
+                утверждение "печать была чёрно-белой" — отчёты должны
+                показывать "не определено", а не "Ч/б" (см. webapp/main.py).
 """
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Optional
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -23,18 +39,42 @@ from sqlalchemy.orm import Session
 from printaudit.models import PriceRule, PrinterQueue
 from printaudit.pricing import match_price
 
+COLOR_SOURCE_EVENT = "event"
+COLOR_SOURCE_QUEUE = "queue"
+COLOR_SOURCE_UNKNOWN = "unknown"
 
-def get_or_create_printer_queue(session: Session, printer_name: str) -> PrinterQueue:
+
+@dataclass
+class PriceResolution:
+    price_per_page: float
+    is_color: Optional[bool]
+    currency: str
+    price_rule_id: Optional[int]
+    color_source: str = COLOR_SOURCE_UNKNOWN
+
+
+def get_or_create_printer_queue(
+    session: Session, printer_name: str, print_server_id: Optional[int] = None
+) -> PrinterQueue:
     """Если задание печатается через очередь, которую ещё не видел ни
     'Обнаружить очереди' (Get-Printer), ни этот резолвер — коллектор создаёт
     её сам как discovered_by_collector=True, unconfigured (color_mode=unknown,
-    collection_enabled=True по умолчанию), не блокируя учёт."""
+    collection_enabled=True по умолчанию), не блокируя учёт.
+
+    Очередь ищется/создаётся В ПРЕДЕЛАХ print_server_id (см.
+    uq_printer_queues_server_name на PrinterQueue) — одноимённые очереди на
+    разных серверах/площадках больше не считаются одной и той же записью."""
     printer_name = (printer_name or "").strip()
     now = datetime.now(timezone.utc)
-    queue = session.query(PrinterQueue).filter_by(printer_name=printer_name).first()
+    queue = (
+        session.query(PrinterQueue)
+        .filter_by(printer_name=printer_name, print_server_id=print_server_id)
+        .first()
+    )
     if queue is None:
         queue = PrinterQueue(
             printer_name=printer_name,
+            print_server_id=print_server_id,
             display_name=printer_name,
             first_seen_at=now,
             last_seen_at=now,
@@ -95,14 +135,34 @@ def resolve_price_rule(session: Session, printer_queue: PrinterQueue, at: dateti
 
 def resolve_price(
     session: Session, printer_queue: PrinterQueue, at: datetime, settings
-) -> Tuple[float, bool, str, Optional[int]]:
+) -> PriceResolution:
     rule = resolve_price_rule(session, printer_queue, at)
     if rule is not None:
-        return rule.price_per_page, rule.is_color, rule.currency, rule.id
+        # Правило (queue-specific или дефолтное) — явная настройка
+        # администратора, is_color всегда определённый bool.
+        return PriceResolution(
+            price_per_page=rule.price_per_page, is_color=rule.is_color, currency=rule.currency,
+            price_rule_id=rule.id, color_source=COLOR_SOURCE_QUEUE,
+        )
 
     if printer_queue.price_per_page is not None:
-        is_color = printer_queue.color_mode == "color"
-        return printer_queue.price_per_page, is_color, printer_queue.currency, None
+        # color_mode остаётся tri-state здесь: "unknown" на очереди должно
+        # остаться is_color=None, а НЕ тихо стать False (это и был баг,
+        # который эта ветка исправляет — раньше сравнение "color_mode ==
+        # 'color'" делало 'unknown' и 'bw' неразличимыми).
+        if printer_queue.color_mode == "color":
+            is_color, color_source = True, COLOR_SOURCE_QUEUE
+        elif printer_queue.color_mode == "bw":
+            is_color, color_source = False, COLOR_SOURCE_QUEUE
+        else:
+            is_color, color_source = None, COLOR_SOURCE_UNKNOWN
+        return PriceResolution(
+            price_per_page=printer_queue.price_per_page, is_color=is_color,
+            currency=printer_queue.currency, price_rule_id=None, color_source=color_source,
+        )
 
-    price, is_color, currency = match_price(session, printer_queue.printer_name, settings)
-    return price, is_color, currency, None
+    price, is_color, currency, color_source = match_price(session, printer_queue.printer_name, settings)
+    return PriceResolution(
+        price_per_page=price, is_color=is_color, currency=currency,
+        price_rule_id=None, color_source=color_source,
+    )

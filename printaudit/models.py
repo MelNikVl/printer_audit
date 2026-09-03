@@ -1,3 +1,4 @@
+import uuid as _uuid_module
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -18,6 +19,10 @@ from printaudit.database import Base
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _new_uuid() -> str:
+    return str(_uuid_module.uuid4())
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +74,27 @@ class PriceList(Base):
 
 
 class PrintJob(Base):
+    """Одно напечатанное задание. `site_code` — исторический денормализованный
+    код площадки, оставлен как есть для обратной совместимости; `site_id`/
+    `print_server_id` — новые ссылки на Site/PrintServer (см. ниже), которые
+    делают идемпотентность и отчётность корректными в многоплощадочной/
+    централизованной установке (см. docs/MULTISITE_ARCHITECTURE.md).
+
+    ВАЖНО про уникальность: старое ограничение (site_code, record_id) снято
+    миграцией 80b73be83524 — EventRecordID уникален только в пределах ОДНОГО
+    журнала событий ОДНОГО Windows Print Server, а не в пределах площадки.
+    Если на площадке два Print Server, у каждого свой независимый счётчик
+    RecordId, и оба могут прислать record_id=42; со старым ограничением
+    второй Print Server не смог бы записать своё задание. Настоящий (и
+    единственный) ключ идемпотентности теперь — (print_server_id, record_id),
+    см. uq_print_jobs_server_record. print_server_id проставляется
+    автоматически (в standalone/agent-режиме коллектор сам заводит себе
+    "неявный" PrintServer при первом запуске — см.
+    printaudit.sites.get_or_create_print_server); остаётся nullable на уровне
+    схемы только для редкого случая, когда историческая БД содержала записи
+    более чем одной площадки и миграция не смогла однозначно сопоставить
+    старые строки серверу (см. docs/MULTISITE_ARCHITECTURE.md)."""
+
     __tablename__ = "print_jobs"
 
     id = Column(Integer, primary_key=True)
@@ -83,23 +109,39 @@ class PrintJob(Base):
     user_login_normalized = Column(String(200), nullable=True, index=True)
     document_name = Column(String(500), nullable=True)
     printer_name = Column(String(200), nullable=False, index=True)
+    # Компьютер, с которого пришло задание (если Event 307 несёт эту информацию
+    # на конкретном сервере/драйвере — не гарантировано, см. docs/RESEARCH.md).
+    source_computer = Column(String(200), nullable=True)
     total_pages = Column(Integer, nullable=False, default=0)
+    # copies/pages_per_copy заполняются ТОЛЬКО если коллектор надёжно извлёк их
+    # из события (никаких выдуманных значений для старых/непроверенных
+    # серверов) — см. docs/MULTISITE_ARCHITECTURE.md, раздел про total_pages.
+    copies = Column(Integer, nullable=True)
+    pages_per_copy = Column(Integer, nullable=True)
     is_color = Column(Boolean, nullable=True)
+    # event | queue | unknown — откуда взято значение is_color, см.
+    # printaudit.printers.resolver.resolve_price. unknown НЕ означает Ч/Б.
+    color_source = Column(String(10), nullable=False, default="unknown")
     department_id = Column(Integer, ForeignKey("departments.id"), nullable=True, index=True)
     printer_queue_id = Column(Integer, ForeignKey("printer_queues.id"), nullable=True, index=True)
+    site_id = Column(Integer, ForeignKey("sites.id"), nullable=True, index=True)
+    print_server_id = Column(Integer, ForeignKey("print_servers.id"), nullable=True, index=True)
     # Тариф и цена ЗАФИКСИРОВАНЫ на момент вставки и больше не пересчитываются
     # при изменении price_rules/price_list — price_rule_id — это только ссылка
     # для трассировки "почему так посчитано", а не источник истины для отчётов.
     price_rule_id = Column(Integer, ForeignKey("price_rules.id"), nullable=True)
     price_per_page = Column(Float, nullable=True)
     cost = Column(Float, nullable=True)
+    currency = Column(String(10), nullable=True)
     created_at = Column(DateTime, nullable=False, default=_utcnow)
 
     department = relationship("Department")
     printer_queue = relationship("PrinterQueue")
+    site = relationship("Site")
+    print_server = relationship("PrintServer")
 
     __table_args__ = (
-        UniqueConstraint("site_code", "record_id", name="uq_print_jobs_site_record"),
+        UniqueConstraint("print_server_id", "record_id", name="uq_print_jobs_server_record"),
     )
 
 
@@ -266,10 +308,18 @@ class AdDepartmentRule(Base):
 
 
 class PrinterQueue(Base):
+    """Одна очередь печати. `printer_name` больше НЕ уникально глобально —
+    одинаковое имя очереди легко повторяется на разных площадках/серверах
+    (например, "HP-3F-BW" на двух объектах). Уникальность теперь —
+    (print_server_id, printer_name), см. uq_printer_queues_server_name;
+    print_server_id nullable по той же причине, что и в PrintJob (см. её
+    docstring и docs/MULTISITE_ARCHITECTURE.md)."""
+
     __tablename__ = "printer_queues"
 
     id = Column(Integer, primary_key=True)
-    printer_name = Column(String(200), unique=True, nullable=False, index=True)
+    printer_name = Column(String(200), nullable=False, index=True)
+    print_server_id = Column(Integer, ForeignKey("print_servers.id"), nullable=True, index=True)
     display_name = Column(String(200), nullable=True)
     server_name = Column(String(200), nullable=True)
     share_name = Column(String(200), nullable=True)
@@ -301,6 +351,12 @@ class PrinterQueue(Base):
 
     created_at = Column(DateTime, nullable=False, default=_utcnow)
     updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    print_server = relationship("PrintServer")
+
+    __table_args__ = (
+        UniqueConstraint("print_server_id", "printer_name", name="uq_printer_queues_server_name"),
+    )
 
 
 class PriceRule(Base):
@@ -368,3 +424,90 @@ class SyncRun(Base):
     duplicates = Column(Integer, nullable=False, default=0)
     error_message = Column(Text, nullable=True)
     details_json = Column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Multisite: площадки, Print Server/агенты, исходящая очередь доставки
+# ---------------------------------------------------------------------------
+
+
+class Site(Base):
+    """Физическая площадка (объект). `site_code` — тот же смысл, что и
+    исторический printaudit.config.Settings.site_code, но теперь как
+    отдельная сущность с устойчивым uuid — так центральный сервер может
+    ссылаться на площадку, не завязываясь на локальный integer id (см.
+    docs/MULTISITE_ARCHITECTURE.md)."""
+
+    __tablename__ = "sites"
+
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String(36), unique=True, nullable=False, default=_new_uuid)
+    site_code = Column(String(50), unique=True, nullable=False, index=True)
+    name = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+
+class PrintServer(Base):
+    """Регистрация одного Windows Print Server / агента на площадке.
+    `status` НЕ хранится как поле — вычисляется по возрасту last_heartbeat_at
+    (см. printaudit.sites.compute_status), чтобы не оказаться навсегда
+    "застрявшим" значением, если агент просто перестал слать heartbeat.
+
+    `token_hash` — SHA-256 сырого токена агента (см. printaudit.security.agent_tokens);
+    сам токен НИКОГДА не хранится и показывается администратору только один
+    раз, в момент создания регистрации/ротации (см. webapp/print_servers_routes.py)."""
+
+    __tablename__ = "print_servers"
+
+    id = Column(Integer, primary_key=True)
+    uuid = Column(String(36), unique=True, nullable=False, default=_new_uuid)
+    site_id = Column(Integer, ForeignKey("sites.id"), nullable=False, index=True)
+    server_name = Column(String(200), nullable=False)
+    display_name = Column(String(200), nullable=True)
+    agent_version = Column(String(50), nullable=True)
+    protocol_version = Column(Integer, nullable=True)
+    last_heartbeat_at = Column(DateTime, nullable=True)
+    last_sync_at = Column(DateTime, nullable=True)
+    pending_queue_size = Column(Integer, nullable=True)
+    last_error = Column(Text, nullable=True)
+    is_disabled = Column(Boolean, nullable=False, default=False)
+    token_hash = Column(String(128), nullable=True)
+    token_created_at = Column(DateTime, nullable=True)
+    token_rotated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    site = relationship("Site")
+
+    __table_args__ = (
+        UniqueConstraint("site_id", "server_name", name="uq_print_servers_site_server"),
+    )
+
+
+class OutboxEvent(Base):
+    """Durable outbox для агента: одна строка на каждое задание печати,
+    ожидающее (или уже получившее подтверждение) отправки в центр. Заводится
+    В ТОЙ ЖЕ транзакции, что и сам PrintJob (см. collector/collect_print_events.py),
+    поэтому перезапуск агента между вставкой задания и его отправкой не может
+    "потерять" задание — см. docs/MULTISITE_ARCHITECTURE.md, раздел про
+    гарантии доставки."""
+
+    __tablename__ = "outbox_events"
+
+    id = Column(Integer, primary_key=True)
+    print_job_id = Column(Integer, ForeignKey("print_jobs.id"), nullable=False, unique=True, index=True)
+    # pending | delivered | failed — "failed" здесь означает "центр явно
+    # отверг событие как невалидное", не "сеть недоступна" (в этом случае
+    # строка остаётся pending и просто ждёт следующей попытки с backoff).
+    status = Column(String(20), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True, index=True)
+    last_error = Column(Text, nullable=True)
+    last_batch_id = Column(String(36), nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+    updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
+
+    print_job = relationship("PrintJob")

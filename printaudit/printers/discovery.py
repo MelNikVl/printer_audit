@@ -79,6 +79,7 @@ class DiscoverySummary:
 def sync_printer_queues(
     session: Session,
     fetch_fn: Callable[[], list] = fetch_local_printers,
+    print_server_id=None,
 ) -> DiscoverySummary:
     """Синхронизирует printer_queues с текущим списком Get-Printer.
 
@@ -88,6 +89,14 @@ def sync_printer_queues(
     вручную (display_name, color_mode, collection_enabled, price_per_page) —
     НИКОГДА не перезаписываются синхронизацией, ни при создании (кроме
     разумных значений по умолчанию), ни при обновлении существующей записи.
+
+    `print_server_id` scoping: очередь ищется/создаётся в пределах ОДНОГО
+    Print Server (см. uq_printer_queues_server_name) — при `None` (обычный
+    standalone-вызов без multisite-контекста) ведёт себя как раньше для
+    единственного неявного сервера. `missing` (очереди, пропавшие из
+    Get-Printer) также ограничивается тем же print_server_id, чтобы
+    обнаружение на одном сервере не помечало "пропавшими" очереди других
+    серверов/площадок в той же центральной БД.
     """
     raw_printers = fetch_fn()
     now = datetime.now(timezone.utc)
@@ -101,10 +110,15 @@ def sync_printer_queues(
         seen_names.add(name)
         summary.seen += 1
 
-        queue = session.query(PrinterQueue).filter_by(printer_name=name).first()
+        queue = (
+            session.query(PrinterQueue)
+            .filter_by(printer_name=name, print_server_id=print_server_id)
+            .first()
+        )
         if queue is None:
             queue = PrinterQueue(
                 printer_name=name,
+                print_server_id=print_server_id,
                 display_name=name,
                 first_seen_at=now,
                 color_mode="unknown",
@@ -137,6 +151,7 @@ def sync_printer_queues(
     missing = (
         session.query(PrinterQueue)
         .filter(PrinterQueue.is_active.is_(True))
+        .filter_by(print_server_id=print_server_id)
         .filter(~PrinterQueue.printer_name.in_(seen_names))
         .all()
     )

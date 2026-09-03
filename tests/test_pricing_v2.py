@@ -15,9 +15,10 @@ def test_default_rule_applies_when_no_queue_specific_rule(app_env):
     session.commit()
 
     from printaudit.config import get_settings
-    price, is_color, currency, rule_id = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
-    assert price == 5.0
-    assert is_color is False
+    resolution = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
+    assert resolution.price_per_page == 5.0
+    assert resolution.is_color is False
+    assert resolution.color_source == "queue"
     session.close()
 
 
@@ -33,9 +34,9 @@ def test_queue_specific_rule_beats_default_regardless_of_priority(app_env):
     session.commit()
 
     from printaudit.config import get_settings
-    price, is_color, currency, rule_id = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
-    assert price == 40.0
-    assert is_color is True
+    resolution = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
+    assert resolution.price_per_page == 40.0
+    assert resolution.is_color is True
     session.close()
 
 
@@ -51,8 +52,8 @@ def test_higher_priority_rule_wins_among_queue_specific_rules(app_env):
     session.commit()
 
     from printaudit.config import get_settings
-    price, *_ = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
-    assert price == 6.0
+    resolution = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
+    assert resolution.price_per_page == 6.0
     session.close()
 
 
@@ -74,8 +75,8 @@ def test_expired_rule_is_not_applied(app_env):
     session.commit()
 
     from printaudit.config import get_settings
-    price, *_ = resolve_price(session, queue, now, get_settings())
-    assert price == 5.0  # старое правило истекло, применился дефолт
+    resolution = resolve_price(session, queue, now, get_settings())
+    assert resolution.price_per_page == 5.0  # старое правило истекло, применился дефолт
     session.close()
 
 
@@ -92,8 +93,8 @@ def test_future_rule_is_not_yet_applied(app_env):
     session.commit()
 
     from printaudit.config import get_settings
-    price, *_ = resolve_price(session, queue, now, get_settings())
-    assert price == 5.0
+    resolution = resolve_price(session, queue, now, get_settings())
+    assert resolution.price_per_page == 5.0
     session.close()
 
 
@@ -108,14 +109,44 @@ def test_fallback_to_printer_queue_quick_price_when_no_rules(app_env):
     session.commit()
 
     from printaudit.config import get_settings
-    price, is_color, currency, rule_id = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
-    assert price == 12.5
-    assert is_color is True
-    assert rule_id is None
+    resolution = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
+    assert resolution.price_per_page == 12.5
+    assert resolution.is_color is True
+    assert resolution.color_source == "queue"
+    assert resolution.price_rule_id is None
     session.close()
 
 
-def test_fallback_to_settings_default_when_nothing_configured(app_env):
+def test_queue_color_mode_unknown_yields_is_color_none_not_false(app_env):
+    """Регрессия для основного требования Части 2: очередь с price_per_page,
+    но color_mode="unknown" (никто явно не сказал, цветная она или Ч/Б) —
+    is_color ДОЛЖЕН остаться None, а не тихо стать False."""
+    from printaudit.database import SessionLocal
+    from printaudit.printers.resolver import get_or_create_printer_queue, resolve_price
+
+    session = SessionLocal()
+    queue = get_or_create_printer_queue(session, "HP-BW")
+    queue.price_per_page = 9.0
+    assert queue.color_mode == "unknown"
+    session.commit()
+
+    from printaudit.config import get_settings
+    resolution = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
+    assert resolution.price_per_page == 9.0
+    assert resolution.is_color is None
+    assert resolution.color_source == "unknown"
+    session.close()
+
+
+def test_fallback_to_settings_default_when_nothing_configured_is_unknown_not_bw(app_env):
+    """Регрессия для основного требования Части 2: если для очереди вообще
+    ничего не настроено (ни правила, ни быстрый тариф, ни price_list), цвет
+    ДОСТОВЕРНО неизвестен — is_color=None/color_source="unknown". Раньше
+    здесь тихо возвращался is_color=False, что было неверно: "неизвестно" и
+    "чёрно-белая печать подтверждена" — разные утверждения, и отчёты не
+    должны врать о втором, когда на самом деле верно только первое. Цена для
+    биллинга при этом всё равно берётся консервативно по Ч/Б тарифу — это
+    решение о ЦЕНЕ, а не о заявленной цветности."""
     from printaudit.database import SessionLocal
     from printaudit.printers.resolver import get_or_create_printer_queue, resolve_price
 
@@ -125,9 +156,10 @@ def test_fallback_to_settings_default_when_nothing_configured(app_env):
 
     from printaudit.config import get_settings
     settings = get_settings()
-    price, is_color, currency, rule_id = resolve_price(session, queue, datetime.now(timezone.utc), settings)
-    assert price == settings.default_price_bw
-    assert is_color is False
+    resolution = resolve_price(session, queue, datetime.now(timezone.utc), settings)
+    assert resolution.price_per_page == settings.default_price_bw
+    assert resolution.is_color is None
+    assert resolution.color_source == "unknown"
     session.close()
 
 
@@ -144,11 +176,12 @@ def test_historical_cost_unchanged_after_rule_price_is_edited(app_env):
     session.commit()
 
     from printaudit.config import get_settings
-    price, is_color, currency, rule_id = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
+    resolution = resolve_price(session, queue, datetime.now(timezone.utc), get_settings())
     job = PrintJob(
         site_code="TEST", record_id=1, time_created=datetime.now(timezone.utc),
         user_name="DOMAIN\\ivanov", printer_name=queue.printer_name, total_pages=10,
-        printer_queue_id=queue.id, price_rule_id=rule_id, price_per_page=price, cost=price * 10,
+        printer_queue_id=queue.id, price_rule_id=resolution.price_rule_id,
+        price_per_page=resolution.price_per_page, cost=resolution.price_per_page * 10,
     )
     session.add(job)
     session.commit()

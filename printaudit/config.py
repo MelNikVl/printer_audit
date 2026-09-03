@@ -4,6 +4,7 @@
 это удобно, если на объекте несколько инстансов или конфиг лежит в другом месте.
 """
 import os
+import socket
 from pathlib import Path
 
 import yaml
@@ -19,7 +20,20 @@ def _config_path() -> Path:
 class Settings:
     def __init__(self, data: dict, root: Path):
         self.site_code = str(data.get("site_code", "SITE1"))
+        # Имя ЭТОГО Windows Print Server — используется для авто-регистрации
+        # PrintServer (см. printaudit.sites.get_or_create_local_print_server),
+        # который делает print_jobs.print_server_id/printer_queues уникальность
+        # корректной даже на площадке с несколькими серверами. По умолчанию —
+        # реальное имя компьютера, а не что-то, что нужно придумывать вручную.
+        self.server_name = str(data.get("server_name") or socket.gethostname())
         self.db_url = data["db"]["url"]
+
+        agent = data.get("agent", {}) or {}
+        # APP_MODE читается из окружения (.env), а не config.yaml — это
+        # деплой-параметр, не свойство площадки. См. printaudit.agent_settings.
+        self.agent_max_batch_size = int(agent.get("max_batch_size", 500))
+        self.agent_http_timeout_seconds = float(agent.get("http_timeout_seconds", 30))
+        self.agent_sync_interval_minutes = int(agent.get("sync_interval_minutes", 2))
         self.currency = data.get("currency", "KZT")
         self.default_price_bw = float(data.get("default_price_per_page_bw", 8))
         self.default_price_color = float(data.get("default_price_per_page_color", 40))

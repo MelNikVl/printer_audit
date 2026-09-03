@@ -42,6 +42,7 @@ from printaudit.models import (
 from printaudit.models import User as LegacyUser
 from printaudit.printers.discovery import PrinterDiscoveryError, sync_printer_queues
 from printaudit.printers.resolver import resolve_price
+from printaudit.sites import get_or_create_local_print_server
 from printaudit.timeutil import utcnow
 from webapp.deps import (
     csrf_token,
@@ -700,8 +701,9 @@ def admin_printers_discover(
     request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
 ):
     started = utcnow()
+    print_server = get_or_create_local_print_server(db)
     try:
-        summary = sync_printer_queues(db)
+        summary = sync_printer_queues(db, print_server_id=print_server.id)
     except PrinterDiscoveryError as exc:
         db.rollback()
         db.add(
@@ -840,8 +842,10 @@ def admin_pricing_test(
     if queue is None:
         return {"error": "Очередь не найдена"}
     at_dt = _parse_date_or_none(at) or utcnow()
-    price, is_color, currency, rule_id = resolve_price(db, queue, at_dt, get_settings())
+    resolution = resolve_price(db, queue, at_dt, get_settings())
     return {
-        "printer_queue": queue.printer_name, "price_per_page": price, "is_color": is_color,
-        "currency": currency, "price_rule_id": rule_id, "pages": pages, "total_cost": round(price * pages, 2),
+        "printer_queue": queue.printer_name, "price_per_page": resolution.price_per_page,
+        "is_color": resolution.is_color, "color_source": resolution.color_source,
+        "currency": resolution.currency, "price_rule_id": resolution.price_rule_id,
+        "pages": pages, "total_cost": round(resolution.price_per_page * pages, 2),
     }
