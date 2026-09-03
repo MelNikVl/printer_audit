@@ -1,0 +1,72 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Print Server / агенты</h1>
+<p class="muted">
+  Статус вычисляется по возрасту heartbeat (не хранится как навсегда установленное значение):
+  online &le; 5 мин, warning &le; 30 мин, иначе offline. Токен агента показывается только один раз —
+  при регистрации или ротации; в БД хранится только его хэш.
+</p>
+
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>Площадка</th><th>Сервер</th><th>Статус</th><th>Версия агента</th>
+    <th>Последний heartbeat</th><th>Последняя синхронизация</th><th>Ждёт отправки</th>
+    <th>Последняя ошибка</th><th>Принтеров</th><th>Заданий сегодня</th><th></th>
+  </tr>
+  {% for row in rows %}
+  {% set server = row.server %}
+  <tr>
+    <td>{{ server.site.name }}</td>
+    <td>{{ server.display_name or server.server_name }}</td>
+    <td><span class="status-{{ row.status }}">{{ row.status }}</span></td>
+    <td>{{ server.agent_version or "" }}</td>
+    <td>{{ server.last_heartbeat_at.strftime("%Y-%m-%d %H:%M:%S") if server.last_heartbeat_at else "никогда" }}</td>
+    <td>{{ server.last_sync_at.strftime("%Y-%m-%d %H:%M:%S") if server.last_sync_at else "никогда" }}</td>
+    <td>{{ server.pending_queue_size if server.pending_queue_size is not none else "" }}</td>
+    <td>{{ server.last_error or "" }}</td>
+    <td>{{ row.printer_count }}</td>
+    <td>{{ row.jobs_today }}</td>
+    <td class="actions-inline">
+      <form method="post" action="/admin/print-servers/{{ server.id }}/rotate-token" class="inline-form"
+            onclick="return confirm('Перевыпустить токен для «{{ server.server_name }}»? Старый токен сразу перестанет работать.')">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Перевыпустить токен</button>
+      </form>
+      {% if server.is_disabled %}
+      <form method="post" action="/admin/print-servers/{{ server.id }}/enable" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Включить</button>
+      </form>
+      {% else %}
+      <form method="post" action="/admin/print-servers/{{ server.id }}/disable" class="inline-form"
+            onclick="return confirm('Отключить «{{ server.server_name }}»? Токен сразу перестанет приниматься.')">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-danger">Отключить</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="11" class="empty-state">Print Server пока не зарегистрированы</td></tr>
+  {% endfor %}
+</table>
+</div>
+
+<h2>Новая регистрация Print Server</h2>
+<form class="filters" method="post" action="/admin/print-servers/create">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div>
+    <label>Площадка</label>
+    <select name="site_id" required>
+      {% for s in sites %}<option value="{{ s.id }}">{{ s.name }} ({{ s.site_code }})</option>{% endfor %}
+    </select>
+  </div>
+  <div><label>Имя сервера</label><input type="text" name="server_name" required placeholder="PRINTSRV01"></div>
+  <div><label>Отображаемое имя</label><input type="text" name="display_name"></div>
+  <button type="submit">Зарегистрировать и выдать токен</button>
+</form>
+<p class="muted">
+  Если площадок пока нет — сначала создайте площадку на <a href="/admin/sites">странице «Площадки»</a>.
+</p>
+{% endblock %}

@@ -3,6 +3,20 @@
 <h1>Дашборд печати{% if site_code %} — {{ site_code }}{% endif %}</h1>
 <h2>Текущий месяц ({{ month_label }})</h2>
 
+{% if sites %}
+<form class="filters" method="get">
+  <div>
+    <label>Площадка</label>
+    <select name="site_id" onchange="this.form.submit()">
+      <option value="">все площадки</option>
+      {% for s in sites %}
+      <option value="{{ s.id }}" {% if site_id == s.id %}selected{% endif %}>{{ s.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+</form>
+{% endif %}
+
 <div class="cards">
   <div class="card"><div class="value">{{ totals.pages }}</div><div class="label">Страниц напечатано</div></div>
   <div class="card"><div class="value">{{ "%.2f"|format(totals.cost) }} {{ currency }}</div><div class="label">Стоимость</div></div>

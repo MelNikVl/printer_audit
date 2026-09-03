@@ -138,12 +138,17 @@ def date_filters(date_from: Optional[str], date_to: Optional[str]):
 
 
 @app.get("/")
-def dashboard(request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_login)):
+def dashboard(
+    request: Request,
+    site_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: AppUser = Depends(require_login),
+):
     settings = get_settings()
     start, end = queries.month_bounds()
-    t = queries.totals(db, date_from=start, date_to=end)
-    top_depts = queries.by_department(db, date_from=start, date_to=end)[:5]
-    top_users = queries.by_user(db, date_from=start, date_to=end)[:5]
+    t = queries.totals(db, date_from=start, date_to=end, site_id=site_id)
+    top_depts = queries.by_department(db, date_from=start, date_to=end, site_id=site_id)[:5]
+    top_users = queries.by_user(db, date_from=start, date_to=end, site_id=site_id)[:5]
     return templates.TemplateResponse(
         "dashboard.html",
         {
@@ -151,6 +156,8 @@ def dashboard(request: Request, db: Session = Depends(get_db), current_user: App
             "current_user": current_user,
             "csrf_token": csrf_token(request),
             "site_code": settings.site_code,
+            "site_id": site_id,
+            "sites": db.query(Site).order_by(Site.name).all(),
             "totals": t,
             "top_depts": top_depts,
             "top_users": top_users,
@@ -165,16 +172,18 @@ def page_by_department(
     request: Request,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    site_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_login),
 ):
     d_from, d_to, df, dt = date_filters(date_from, date_to)
-    rows = queries.by_department(db, date_from=d_from, date_to=d_to)
+    rows = queries.by_department(db, date_from=d_from, date_to=d_to, site_id=site_id)
     return templates.TemplateResponse(
         "by_department.html",
         {
             "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
             "rows": rows, "date_from": df, "date_to": dt, "currency": get_settings().currency,
+            "site_id": site_id, "sites": db.query(Site).order_by(Site.name).all(),
         },
     )
 
@@ -185,16 +194,18 @@ def page_by_user(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     department_id: Optional[int] = None,
+    site_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_login),
 ):
     d_from, d_to, df, dt = date_filters(date_from, date_to)
-    rows = queries.by_user(db, date_from=d_from, date_to=d_to, department_id=department_id)
+    rows = queries.by_user(db, date_from=d_from, date_to=d_to, department_id=department_id, site_id=site_id)
     return templates.TemplateResponse(
         "by_user.html",
         {
             "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
             "rows": rows, "date_from": df, "date_to": dt, "currency": get_settings().currency,
+            "site_id": site_id, "sites": db.query(Site).order_by(Site.name).all(),
         },
     )
 
@@ -204,16 +215,18 @@ def page_by_printer(
     request: Request,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    site_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_login),
 ):
     d_from, d_to, df, dt = date_filters(date_from, date_to)
-    rows = queries.by_printer(db, date_from=d_from, date_to=d_to)
+    rows = queries.by_printer(db, date_from=d_from, date_to=d_to, site_id=site_id)
     return templates.TemplateResponse(
         "by_printer.html",
         {
             "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
             "rows": rows, "date_from": df, "date_to": dt, "currency": get_settings().currency,
+            "site_id": site_id, "sites": db.query(Site).order_by(Site.name).all(),
         },
     )
 

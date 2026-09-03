@@ -37,13 +37,16 @@ from printaudit.models import (
     PriceRule,
     PrinterQueue,
     PrintJob,
+    PrintServer,
+    Site,
     SyncRun,
 )
 from printaudit.models import User as LegacyUser
 from printaudit.printers.discovery import PrinterDiscoveryError, sync_printer_queues
 from printaudit.printers.resolver import resolve_price
-from printaudit.sites import get_or_create_local_print_server
-from printaudit.timeutil import utcnow
+from printaudit.security.agent_tokens import generate_agent_token, hash_agent_token
+from printaudit.sites import compute_status, get_or_create_local_print_server
+from printaudit.timeutil import naive_utc, utcnow
 from webapp.deps import (
     csrf_token,
     get_ad_client,
@@ -849,3 +852,176 @@ def admin_pricing_test(
         "currency": resolution.currency, "price_rule_id": resolution.price_rule_id,
         "pages": pages, "total_cost": round(resolution.price_per_page * pages, 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# Площадки и центральный менеджер Print Server (см. docs/MULTISITE_ARCHITECTURE.md)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sites")
+def admin_sites(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    sites = db.query(Site).order_by(Site.name).all()
+    return templates.TemplateResponse(
+        "admin/sites.html",
+        {"request": request, "current_user": current_user, "csrf_token": csrf_token(request), "sites": sites},
+    )
+
+
+@router.post("/sites/create", dependencies=[Depends(require_csrf)])
+def admin_sites_create(
+    request: Request,
+    site_code: str = Form(...), name: str = Form(""), description: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    site_code = site_code.strip()
+    if not site_code:
+        return _redirect("/admin/sites", err="site_code обязателен")
+    if db.query(Site).filter_by(site_code=site_code).first():
+        return _redirect("/admin/sites", err=f"Площадка с site_code «{site_code}» уже существует")
+    site = Site(site_code=site_code, name=(name.strip() or site_code), description=description or None, is_active=True)
+    db.add(site)
+    db.flush()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="site.create", object_type="site",
+        object_id=site.id, new_value={"site_code": site_code}, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/sites", msg=f"Площадка «{site.name}» создана")
+
+
+@router.get("/print-servers")
+def admin_print_servers(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    servers = db.query(PrintServer).order_by(PrintServer.site_id, PrintServer.server_name).all()
+    today_start = naive_utc(utcnow()).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = []
+    for server in servers:
+        jobs_today = (
+            db.query(func.count(PrintJob.id))
+            .filter(PrintJob.print_server_id == server.id, PrintJob.time_created >= today_start)
+            .scalar()
+            or 0
+        )
+        printer_count = (
+            db.query(func.count(PrinterQueue.id))
+            .filter(PrinterQueue.print_server_id == server.id, PrinterQueue.is_active.is_(True))
+            .scalar()
+            or 0
+        )
+        rows.append(
+            {
+                "server": server,
+                "status": compute_status(server),
+                "jobs_today": jobs_today,
+                "printer_count": printer_count,
+                "has_token": bool(server.token_hash),
+            }
+        )
+    sites = db.query(Site).filter_by(is_active=True).order_by(Site.name).all()
+    return templates.TemplateResponse(
+        "admin/print_servers.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "rows": rows, "sites": sites,
+        },
+    )
+
+
+@router.post("/print-servers/create", dependencies=[Depends(require_csrf)])
+def admin_print_servers_create(
+    request: Request,
+    site_id: int = Form(...), server_name: str = Form(...), display_name: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    site = db.get(Site, site_id)
+    if site is None:
+        return _redirect("/admin/print-servers", err="Площадка не найдена")
+    server_name = server_name.strip()
+    if not server_name:
+        return _redirect("/admin/print-servers", err="Имя сервера обязательно")
+    if db.query(PrintServer).filter_by(site_id=site_id, server_name=server_name).first():
+        return _redirect("/admin/print-servers", err=f"Сервер «{server_name}» уже зарегистрирован на этой площадке")
+
+    raw_token = generate_agent_token()
+    server = PrintServer(
+        site_id=site_id, server_name=server_name, display_name=display_name.strip() or server_name,
+        token_hash=hash_agent_token(raw_token), token_created_at=utcnow(),
+    )
+    db.add(server)
+    db.flush()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="print_server.create", object_type="print_server",
+        object_id=server.id, new_value={"site_id": site_id, "server_name": server_name},
+        ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect(
+        "/admin/print-servers",
+        msg=(
+            f"Print Server «{server_name}» зарегистрирован. Токен агента (показывается один раз, "
+            f"скопируйте в AGENT_TOKEN в .env агента): {raw_token}"
+        ),
+    )
+
+
+@router.post("/print-servers/{server_id}/rotate-token", dependencies=[Depends(require_csrf)])
+def admin_print_servers_rotate_token(
+    server_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    server = db.get(PrintServer, server_id)
+    if server is None:
+        return _redirect("/admin/print-servers", err="Print Server не найден")
+    raw_token = generate_agent_token()
+    server.token_hash = hash_agent_token(raw_token)
+    server.token_rotated_at = utcnow()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="print_server.rotate_token", object_type="print_server",
+        object_id=server.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect(
+        "/admin/print-servers",
+        msg=(
+            f"Токен для «{server.server_name}» перевыпущен (старый немедленно недействителен). "
+            f"Новый токен (показывается один раз): {raw_token}"
+        ),
+    )
+
+
+@router.post("/print-servers/{server_id}/disable", dependencies=[Depends(require_csrf)])
+def admin_print_servers_disable(
+    server_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    server = db.get(PrintServer, server_id)
+    if server is None:
+        return _redirect("/admin/print-servers", err="Print Server не найден")
+    server.is_disabled = True
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="print_server.disable", object_type="print_server",
+        object_id=server.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/print-servers", msg=f"Print Server «{server.server_name}» отключён — токен больше не принимается")
+
+
+@router.post("/print-servers/{server_id}/enable", dependencies=[Depends(require_csrf)])
+def admin_print_servers_enable(
+    server_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    server = db.get(PrintServer, server_id)
+    if server is None:
+        return _redirect("/admin/print-servers", err="Print Server не найден")
+    server.is_disabled = False
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="print_server.enable", object_type="print_server",
+        object_id=server.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/print-servers", msg=f"Print Server «{server.server_name}» включён")

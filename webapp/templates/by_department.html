@@ -5,6 +5,17 @@
 <form class="filters" method="get">
   <div><label>С</label><input type="date" name="date_from" value="{{ date_from }}"></div>
   <div><label>По</label><input type="date" name="date_to" value="{{ date_to }}"></div>
+  {% if sites %}
+  <div>
+    <label>Площадка</label>
+    <select name="site_id">
+      <option value="">все</option>
+      {% for s in sites %}
+      <option value="{{ s.id }}" {% if site_id == s.id %}selected{% endif %}>{{ s.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  {% endif %}
   <button type="submit">Применить</button>
 </form>
 
