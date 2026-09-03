@@ -57,15 +57,38 @@ from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from printaudit.agent_settings import AGENT_VERSION, PROTOCOL_VERSION, get_agent_settings, is_agent_mode  # noqa: E402
+from printaudit.agent_settings import (  # noqa: E402
+    AGENT_VERSION,
+    MONITORING_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+    get_agent_settings,
+    is_agent_mode,
+)
 from printaudit.config import get_settings  # noqa: E402
 from printaudit.database import SessionLocal  # noqa: E402
-from printaudit.models import OutboxEvent, PrintJob  # noqa: E402
+from printaudit.models import (  # noqa: E402
+    MonitoringSyncState,
+    OutboxEvent,
+    PrinterAlert,
+    PrinterCounterSample,
+    PrinterDevice,
+    PrinterHealthSample,
+    PrinterSupplySample,
+    PrintJob,
+)
+from printaudit.monitoring import MONITORING_SOURCE_SNMP, MONITORING_SOURCE_ZABBIX  # noqa: E402
+from printaudit.sites import get_or_create_local_print_server  # noqa: E402
 from printaudit.timeutil import naive_utc, utcnow  # noqa: E402
 
 BACKOFF_BASE_SECONDS = 30
 BACKOFF_MAX_SECONDS = 1800
 BACKOFF_JITTER_RATIO = 0.3
+
+# Сколько сэмплов/алертов максимум за один пакет мониторинга -- центр
+# независимо ограничивает тем же числом со своей стороны (см.
+# webapp/agent_api.py::MAX_MONITORING_ITEMS_PER_BATCH), это лимит именно
+# того, сколько агент готов набрать за один запрос.
+MAX_MONITORING_ITEMS_PER_BATCH = 500
 
 
 class AgentSyncError(RuntimeError):
@@ -188,6 +211,203 @@ def send_heartbeat(client, base_url: str, token: str, timeout: float, payload: d
         raise AgentSyncError(f"Не удалось отправить heartbeat: {exc}") from exc
 
 
+def send_monitoring_batch(client, base_url: str, token: str, timeout: float, payload: dict) -> dict:
+    import httpx
+
+    try:
+        resp = client.post(
+            f"{base_url.rstrip('/')}/api/v1/agent/monitoring/batch",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.HTTPError as exc:
+        raise AgentSyncError(f"Не удалось отправить мониторинговые данные в центр: {exc}") from exc
+
+
+def _get_or_create_monitoring_sync_state(session, site_id: int) -> MonitoringSyncState:
+    state = session.get(MonitoringSyncState, site_id)
+    if state is None:
+        state = MonitoringSyncState(site_id=site_id)
+        session.add(state)
+        session.flush()
+    return state
+
+
+def _build_monitoring_payload(session, site, state: MonitoringSyncState, limit: int):
+    """Курсор по id для health/counter/supply (только INSERT — id
+    монотонно растёт); по updated_at для алертов (они ещё и обновляются
+    при resolve). Устройства отправляются ВСЕ активные с включённым
+    мониторингом каждый раз, когда есть хоть один сэмпл/алерт для отправки
+    — дёшево (обычно десятки-сотни устройств на площадку) и гарантирует,
+    что центр успеет узнать о новом устройстве до первого сэмпла на него."""
+    devices = (
+        session.query(PrinterDevice)
+        .filter(
+            PrinterDevice.site_id == site.id,
+            PrinterDevice.is_active.is_(True),
+            PrinterDevice.monitoring_source.in_([MONITORING_SOURCE_ZABBIX, MONITORING_SOURCE_SNMP]),
+        )
+        .all()
+    )
+    device_by_id = {d.id: d for d in devices}
+
+    health_rows = (
+        session.query(PrinterHealthSample)
+        .join(PrinterDevice, PrinterHealthSample.printer_device_id == PrinterDevice.id)
+        .filter(PrinterDevice.site_id == site.id, PrinterHealthSample.id > state.last_health_sample_id)
+        .order_by(PrinterHealthSample.id)
+        .limit(limit)
+        .all()
+    )
+    counter_rows = (
+        session.query(PrinterCounterSample)
+        .join(PrinterDevice, PrinterCounterSample.printer_device_id == PrinterDevice.id)
+        .filter(PrinterDevice.site_id == site.id, PrinterCounterSample.id > state.last_counter_sample_id)
+        .order_by(PrinterCounterSample.id)
+        .limit(limit)
+        .all()
+    )
+    supply_rows = (
+        session.query(PrinterSupplySample)
+        .join(PrinterDevice, PrinterSupplySample.printer_device_id == PrinterDevice.id)
+        .filter(PrinterDevice.site_id == site.id, PrinterSupplySample.id > state.last_supply_sample_id)
+        .order_by(PrinterSupplySample.id)
+        .limit(limit)
+        .all()
+    )
+    alert_cursor = naive_utc(state.last_alert_synced_at) or datetime(1970, 1, 1)
+    alert_rows = (
+        session.query(PrinterAlert)
+        .join(PrinterDevice, PrinterAlert.printer_device_id == PrinterDevice.id)
+        .filter(PrinterDevice.site_id == site.id, PrinterAlert.updated_at > alert_cursor)
+        .order_by(PrinterAlert.updated_at)
+        .limit(limit)
+        .all()
+    )
+
+    if not (health_rows or counter_rows or supply_rows or alert_rows):
+        return None
+
+    def _device_uuid(row):
+        return device_by_id.get(row.printer_device_id).uuid if row.printer_device_id in device_by_id else row.printer_device.uuid
+
+    payload = {
+        "devices": [
+            {
+                "device_uuid": d.uuid, "display_name": d.display_name, "hostname": d.hostname,
+                "ip_address": d.ip_address, "vendor": d.vendor, "model": d.model,
+            }
+            for d in devices
+        ],
+        "health_samples": [
+            {
+                "device_uuid": _device_uuid(r), "collected_at": r.collected_at.replace(tzinfo=timezone.utc).isoformat(),
+                "source": r.source, "is_reachable": r.is_reachable, "device_status": r.device_status,
+                "has_paper_jam": r.has_paper_jam, "has_cover_open": r.has_cover_open,
+                "has_paper_out": r.has_paper_out, "has_hardware_error": r.has_hardware_error,
+                "raw_status_text": r.raw_status_text,
+            }
+            for r in health_rows
+        ],
+        "counter_samples": [
+            {
+                "device_uuid": _device_uuid(r), "collected_at": r.collected_at.replace(tzinfo=timezone.utc).isoformat(),
+                "source": r.source, "total_pages": r.total_pages, "color_pages": r.color_pages, "bw_pages": r.bw_pages,
+            }
+            for r in counter_rows
+        ],
+        "supply_samples": [
+            {
+                "device_uuid": _device_uuid(r), "collected_at": r.collected_at.replace(tzinfo=timezone.utc).isoformat(),
+                "source": r.source, "supply_type": r.supply_type, "level_percent": r.level_percent,
+                "level_status": r.level_status,
+            }
+            for r in supply_rows
+        ],
+        "alerts": [
+            {
+                "device_uuid": _device_uuid(r), "source": r.source, "alert_type": r.alert_type,
+                "severity": r.severity, "message": r.message, "external_id": r.external_id,
+                "opened_at": r.opened_at.replace(tzinfo=timezone.utc).isoformat(),
+                "resolved_at": r.resolved_at.replace(tzinfo=timezone.utc).isoformat() if r.resolved_at else None,
+            }
+            for r in alert_rows
+        ],
+    }
+    cursors = {
+        "health_id": health_rows[-1].id if health_rows else state.last_health_sample_id,
+        "counter_id": counter_rows[-1].id if counter_rows else state.last_counter_sample_id,
+        "supply_id": supply_rows[-1].id if supply_rows else state.last_supply_sample_id,
+        "alert_at": alert_rows[-1].updated_at if alert_rows else state.last_alert_synced_at,
+    }
+    return payload, cursors
+
+
+def sync_monitoring_data(session, agent_settings, settings, log, client_override=None) -> None:
+    """Отправляет накопленные мониторинговые сэмплы/алерты этой площадки в
+    центр — курсором (не полноценным outbox с pending/failed): каждое
+    значение и так идемпотентно по своим UNIQUE-ограничениям на приёме
+    (см. webapp/agent_api.py), поэтому повторная отправка с неподвинутым
+    курсором после сбоя безопасна сама по себе, без отдельного состояния
+    на строку."""
+    local_server = get_or_create_local_print_server(session, settings)
+    site = local_server.site
+    state = _get_or_create_monitoring_sync_state(session, site.id)
+
+    built = _build_monitoring_payload(session, site, state, MAX_MONITORING_ITEMS_PER_BATCH)
+    if built is None:
+        return
+    body, cursors = built
+
+    payload = {
+        "protocol_version": MONITORING_PROTOCOL_VERSION,
+        "site_uuid": agent_settings.site_uuid,
+        "print_server_uuid": agent_settings.print_server_uuid,
+        "generated_at": utcnow().isoformat(),
+        **body,
+    }
+
+    state.last_attempt_at = naive_utc(utcnow())
+    try:
+        import httpx
+
+        if client_override is not None:
+            result = send_monitoring_batch(
+                client_override, agent_settings.central_base_url, agent_settings.token,
+                settings.agent_http_timeout_seconds, payload,
+            )
+        else:
+            with httpx.Client() as client:
+                result = send_monitoring_batch(
+                    client, agent_settings.central_base_url, agent_settings.token,
+                    settings.agent_http_timeout_seconds, payload,
+                )
+    except AgentSyncError as exc:
+        state.last_error = str(exc)
+        session.commit()
+        log.warning("Мониторинговые данные не отправлены (будет повторная попытка позже): %s", exc)
+        return
+
+    state.last_health_sample_id = cursors["health_id"]
+    state.last_counter_sample_id = cursors["counter_id"]
+    state.last_supply_sample_id = cursors["supply_id"]
+    state.last_alert_synced_at = cursors["alert_at"]
+    state.last_success_at = naive_utc(utcnow())
+    state.last_error = None
+    session.commit()
+    log.info(
+        "Мониторинг отправлен: устройств=%d health=%d/%d counter=%d/%d supply=%d/%d alerts=%d",
+        result.get("devices_upserted", 0),
+        result.get("health_accepted", 0), result.get("health_duplicates", 0),
+        result.get("counter_accepted", 0), result.get("counter_duplicates", 0),
+        result.get("supply_accepted", 0), result.get("supply_duplicates", 0),
+        result.get("alerts_accepted", 0),
+    )
+
+
 def run_once(retry_failed: bool = False) -> None:
     settings = get_settings()
     agent_settings = get_agent_settings()
@@ -274,6 +494,14 @@ def run_once(retry_failed: bool = False) -> None:
                 log.warning("Пакет не доставлен (будет повторная попытка позже): %s", exc)
         else:
             log.info("Очередь на отправку пуста.")
+
+        # Мониторинг принтеров -- отдельный протокол/курсор, не влияет на
+        # outbox заданий печати выше и не блокируется им (см.
+        # sync_monitoring_data). Сбой здесь тоже не должен ронять run_once().
+        try:
+            sync_monitoring_data(session, agent_settings, settings, log)
+        except Exception as exc:  # noqa: BLE001 - мониторинг не должен ронять весь запуск
+            log.warning("Синхронизация мониторинга принтеров не удалась: %s", exc)
 
         # pending_queue_size — ТОЛЬКО retryable (status="pending"); терминально
         # отклонённые считаются отдельно (failed_queue_size) и НЕ входят

@@ -167,6 +167,27 @@ class CollectorState(Base):
     last_run_at = Column(DateTime, nullable=True)
 
 
+class MonitoringSyncState(Base):
+    """Курсор отправки мониторинговых сэмплов/алертов площадка -> центр
+    (см. collector/agent_sync.py, webapp/agent_api.py — endpoint
+    /api/v1/agent/monitoring/batch, отдельный от протокола заданий печати,
+    см. docs/PRINTER_MONITORING_FORECASTING.md). Курсор по id для
+    health/counter/supply (только INSERT, id монотонно растёт) и по
+    updated_at для алертов (они ещё и обновляются при resolve, не только
+    создаются)."""
+
+    __tablename__ = "monitoring_sync_state"
+
+    site_id = Column(Integer, ForeignKey("sites.id"), primary_key=True)
+    last_health_sample_id = Column(Integer, nullable=False, default=0)
+    last_counter_sample_id = Column(Integer, nullable=False, default=0)
+    last_supply_sample_id = Column(Integer, nullable=False, default=0)
+    last_alert_synced_at = Column(DateTime, nullable=True)
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_success_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+
+
 # ---------------------------------------------------------------------------
 # Приложение: локальные учётные записи администраторов/просматривающих
 # ---------------------------------------------------------------------------
