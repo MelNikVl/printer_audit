@@ -7,23 +7,41 @@ printaudit/agent_settings.py). Запускается по расписанию 
 друга (недоступность центра не должна останавливать локальный сбор).
 
 Каждый запуск:
-  1. читает из outbox все строки со status != "delivered", у которых
-     next_attempt_at пуст или уже наступил (лимит — agent.max_batch_size
-     из config.yaml);
+  1. читает из outbox все строки со status == "pending" (см. OutboxEvent.status
+     ниже), у которых next_attempt_at пуст или уже наступил (лимит —
+     agent.max_batch_size из config.yaml);
   2. собирает по ним один пакет (POST /api/v1/agent/events/batch);
-  3. по ответу помечает "inserted"/"duplicate" как delivered, "rejected" —
-     оставляет как failed с текстом ошибки (взгляд для диагностики, но
-     всё равно продолжает попадать в следующие попытки — сервер может
-     начать принимать событие после ручного исправления на своей стороне,
-     например создания отсутствующего отдела);
-  4. при полном сбое запроса (сеть/timeout/5xx) НИЧЕГО не помечает
-     delivered — увеличивает attempts и планирует следующую попытку с
-     экспоненциальным backoff + jitter, не бросая исключение наружу
-     (задание Task Scheduler должно завершаться штатно и не шуметь в лог
-     ошибками, ожидаемыми при временной недоступности центра);
-  5. отдельно шлёт heartbeat (agent_version, pending_queue_size,
-     last_error) — даже если пакет событий пуст, чтобы центр видел агента
-     "online", пока сеть в порядке.
+  3. по ответу к каждой строке применяется ровно ОДНО из:
+       - ack "inserted"/"duplicate"  -> status="delivered" (терминально, успех);
+       - ack "rejected"              -> status="failed" (ТЕРМИНАЛЬНО: центр
+         explicit-но отклонил событие как невалидное — это не временный
+         сбой сети, автоматический повтор его не исправит, поэтому
+         next_attempt_at сбрасывается в NULL и строка больше НИКОГДА не
+         попадёт в следующую выборку _fetch_due_outbox_rows(). Исправление
+         причины (например, донастройка чего-то на центральном сервере) и
+         ПОВТОРНАЯ отправка — только вручную, см. --retry-failed ниже);
+       - ack ОТСУТСТВУЕТ для этого record_id (центр вернул 200, но забыл
+         этот конкретный элемент в results — protocol-нарушение с его
+         стороны) -> остаётся status="pending", НЕ terminal, планируется
+         retry с backoff, как и сетевой сбой;
+  4. при полном сбое запроса (сеть/timeout/4xx-5xx кроме собственно
+     ответа с per-event результатами) НИЧЕГО не помечает delivered/failed —
+     все строки пакета остаются status="pending", увеличивается attempts и
+     планируется следующая попытка с экспоненциальным backoff + jitter, не
+     бросая исключение наружу (задание Task Scheduler должно завершаться
+     штатно и не шуметь в лог ошибками, ожидаемыми при временной
+     недоступности центра);
+  5. отдельно шлёт heartbeat (agent_version, pending_queue_size —
+     ТОЛЬКО retryable pending, failed_queue_size — терминально отклонённые
+     отдельно, last_error) — даже если пакет событий пуст, чтобы центр
+     видел агента "online", пока сеть в порядке.
+
+Ручной повтор (`python collector\\agent_sync.py --retry-failed`) — после
+того как причина отклонения устранена (например, вручную создан
+отсутствующий на центре отдел), сбрасывает ВСЕ status="failed" обратно в
+"pending" (next_attempt_at и attempts обнуляются) и сразу же пытается
+отправить их в рамках этого же запуска — безопасная операция, идемпотентна
+(повторный вызов при отсутствии failed-строк ничего не делает).
 
 Не удаляет строки outbox после подтверждённой доставки — они остаются
 delivered=True навсегда как локальная история (см. требование "не удаляй
@@ -81,15 +99,37 @@ def compute_backoff_seconds(attempts: int) -> float:
 
 
 def _fetch_due_outbox_rows(session, limit: int) -> List[OutboxEvent]:
+    """Выбирает ТОЛЬКО retryable события — status="pending" (не "delivered"
+    и не терминальный "failed"), у которых пришло время следующей попытки.
+    До исправления (эта ветка pre-merge hardening) здесь ошибочно был
+    фильтр `status != "delivered"`, который включал и терминально
+    отклонённые "failed" строки — то есть они продолжали бесконечно
+    отправляться повторно, хотя по смыслу "failed" должен быть терминальным."""
     now = naive_utc(utcnow())
     return (
         session.query(OutboxEvent)
-        .filter(OutboxEvent.status != "delivered")
+        .filter(OutboxEvent.status == "pending")
         .filter((OutboxEvent.next_attempt_at.is_(None)) | (OutboxEvent.next_attempt_at <= now))
         .order_by(OutboxEvent.id.asc())
         .limit(limit)
         .all()
     )
+
+
+def retry_failed_rows(session) -> int:
+    """Ручной, явный сброс терминально отклонённых событий обратно в
+    "pending" — единственный предусмотренный способ повторно отправить
+    "failed" строку (автоматика их больше не трогает, см. модульный
+    docstring). Возвращает число сброшенных строк. Идемпотентно: без
+    failed-строк — no-op."""
+    rows = session.query(OutboxEvent).filter(OutboxEvent.status == "failed").all()
+    for row in rows:
+        row.status = "pending"
+        row.attempts = 0
+        row.next_attempt_at = None
+        row.last_error = None
+    session.commit()
+    return len(rows)
 
 
 def _job_to_event_payload(job: PrintJob) -> dict:
@@ -148,7 +188,7 @@ def send_heartbeat(client, base_url: str, token: str, timeout: float, payload: d
         raise AgentSyncError(f"Не удалось отправить heartbeat: {exc}") from exc
 
 
-def run_once() -> None:
+def run_once(retry_failed: bool = False) -> None:
     settings = get_settings()
     agent_settings = get_agent_settings()
     log = setup_logging(settings.log_dir)
@@ -168,6 +208,10 @@ def run_once() -> None:
     session = SessionLocal()
     last_error: Optional[str] = None
     try:
+        if retry_failed:
+            reset_count = retry_failed_rows(session)
+            log.info("--retry-failed: сброшено в pending %d ранее terminal-failed событий.", reset_count)
+
         rows = _fetch_due_outbox_rows(session, settings.agent_max_batch_size)
         if rows:
             events = [_job_to_event_payload(row.print_job) for row in rows]
@@ -186,20 +230,35 @@ def run_once() -> None:
                     )
                 by_record_id = {r["record_id"]: r for r in result.get("results", [])}
                 now = naive_utc(utcnow())
+                missing_ack = 0
                 for row in rows:
                     ack = by_record_id.get(row.print_job.record_id)
-                    if ack is None:
-                        continue
                     row.attempts += 1
-                    if ack["status"] in ("inserted", "duplicate"):
+                    if ack is None:
+                        # Центр вернул успешный ответ, но забыл этот
+                        # record_id в results — не наша вина и не признак
+                        # невалидности события: остаётся pending, обычный
+                        # retry с backoff, как при сетевом сбое.
+                        missing_ack += 1
+                        row.last_error = "Центр не вернул подтверждение для этого события в пакете"
+                        row.next_attempt_at = now + timedelta(seconds=compute_backoff_seconds(row.attempts))
+                    elif ack["status"] in ("inserted", "duplicate"):
                         row.status = "delivered"
                         row.delivered_at = now
                         row.last_error = None
+                        row.next_attempt_at = None
                     else:
+                        # ack["status"] == "rejected" -- ТЕРМИНАЛЬНО: центр
+                        # явно сказал "это невалидные данные", повторная
+                        # автоматическая отправка их не исправит (см.
+                        # docstring модуля и retry_failed_rows() для
+                        # осознанного ручного повтора после исправления причины).
                         row.status = "failed"
                         row.last_error = ack.get("error") or "отклонено центральным сервером"
-                        row.next_attempt_at = now + timedelta(seconds=compute_backoff_seconds(row.attempts))
+                        row.next_attempt_at = None
                 session.commit()
+                if missing_ack:
+                    log.warning("Центр не подтвердил %d событий из пакета — будет повтор.", missing_ack)
                 log.info(
                     "Отправлено %d событий: принято=%d дублей=%d отклонено=%d",
                     len(events), result.get("accepted", 0), result.get("duplicates", 0), result.get("rejected", 0),
@@ -216,9 +275,12 @@ def run_once() -> None:
         else:
             log.info("Очередь на отправку пуста.")
 
-        pending_count = (
-            session.query(OutboxEvent).filter(OutboxEvent.status != "delivered").count()
-        )
+        # pending_queue_size — ТОЛЬКО retryable (status="pending"); терминально
+        # отклонённые считаются отдельно (failed_queue_size) и НЕ входят
+        # сюда — иначе "сколько ещё реально досылать" вводило бы в
+        # заблуждение (failed никогда сам не досошлётся автоматически).
+        pending_count = session.query(OutboxEvent).filter(OutboxEvent.status == "pending").count()
+        failed_count = session.query(OutboxEvent).filter(OutboxEvent.status == "failed").count()
         try:
             with httpx.Client() as client:
                 send_heartbeat(
@@ -230,6 +292,7 @@ def run_once() -> None:
                         "print_server_uuid": agent_settings.print_server_uuid,
                         "agent_version": AGENT_VERSION,
                         "pending_queue_size": pending_count,
+                        "failed_queue_size": failed_count,
                         "last_error": last_error,
                     },
                 )
@@ -240,5 +303,15 @@ def run_once() -> None:
 
 
 if __name__ == "__main__":
-    argparse.ArgumentParser(description=__doc__).parse_args()
-    run_once()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=(
+            "Сбросить все терминально отклонённые (status=failed) события outbox обратно в pending "
+            "и сразу попытаться отправить их. Использовать вручную ПОСЛЕ того, как причина отклонения "
+            "устранена (например, на центральном сервере донастроено то, чего не хватало)."
+        ),
+    )
+    args = parser.parse_args()
+    run_once(retry_failed=args.retry_failed)

@@ -28,12 +28,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException  # noqa
 
 from printaudit import queries  # noqa: E402
 from printaudit.ad_settings import validate_session_secret  # noqa: E402
+from printaudit.agent_settings import get_agent_settings  # noqa: E402
 from printaudit.config import get_settings  # noqa: E402
 from printaudit.models import AppUser, Department, PrintJob, PrintServer, Site  # noqa: E402
 from webapp import admin_routes, agent_api, auth_routes  # noqa: E402
 from webapp.deps import csrf_token, get_db, require_login  # noqa: E402
 from webapp.errors import Forbidden, MustChangePassword, NotAuthenticated  # noqa: E402
-from webapp.middleware import CsrfCookieMiddleware  # noqa: E402
+from webapp.middleware import CsrfCookieMiddleware, TrustedProxyHeadersMiddleware  # noqa: E402
 from webapp.templating import BASE_DIR, templates  # noqa: E402
 
 
@@ -48,11 +49,18 @@ async def lifespan(_app: FastAPI):
     # collector'у/CLI-скриптам, которым веб-сессии не нужны вообще, и им не
     # следует падать из-за отсутствия этой переменной.
     validate_session_secret(os.environ.get("SESSION_SECRET_KEY"))
+    # Тот же принцип для APP_MODE: get_agent_settings() бросает
+    # InvalidAppModeError, если APP_MODE задан, но не является ни
+    # standalone/agent/central — опечатка в .env не должна незаметно
+    # откатывать сервер к поведению по умолчанию (см. printaudit/agent_settings.py).
+    get_agent_settings()
     yield
 
 
 app = FastAPI(title="Print Audit", lifespan=lifespan)
 app.add_middleware(CsrfCookieMiddleware)
+app.add_middleware(agent_api.MaxBodySizeMiddleware)
+app.add_middleware(TrustedProxyHeadersMiddleware)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 app.include_router(auth_routes.router)
@@ -98,10 +106,25 @@ async def _http_exception_handler(request: Request, exc: StarletteHTTPException)
     )
 
 
+def _safe_validation_errors(exc: RequestValidationError) -> list:
+    """pydantic's exc.errors() включает "input" (сырое значение поля ровно
+    таким, каким его прислал клиент) и "ctx" (может содержать объект
+    исключения из кастомного @field_validator, например ValueError -- см.
+    webapp/agent_api.py::_reject_non_finite) — ни то, ни другое не
+    гарантированно сериализуется в JSON (json.dumps с allow_nan=False,
+    как у Starlette JSONResponse, падает на float NaN/Infinity; объект
+    исключения не сериализуется вообще никогда). Раньше это приводило к
+    500 при попытке ответить 422 на как раз тот невалидный ввод, который
+    и должен был получить понятную ошибку. Отдаём только заведомо
+    JSON-safe поля (type/loc/msg) — это заодно не отражает обратно
+    клиенту произвольные присланные им значения."""
+    return [{"type": e.get("type"), "loc": e.get("loc"), "msg": e.get("msg")} for e in exc.errors()]
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_exception_handler(request: Request, exc: RequestValidationError):
     if _is_api_path(request.url.path):
-        return JSONResponse(status_code=422, content={"detail": exc.errors()})
+        return JSONResponse(status_code=422, content={"detail": _safe_validation_errors(exc)})
     return templates.TemplateResponse(
         "403.html", {"request": request, "message": "Некорректный запрос."}, status_code=400
     )

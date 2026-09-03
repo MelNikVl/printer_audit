@@ -6,13 +6,22 @@
   online &le; 5 мин, warning &le; 30 мин, иначе offline. Токен агента показывается только один раз —
   при регистрации или ротации; в БД хранится только его хэш.
 </p>
+<p class="muted">
+  «Последний контакт» — любой успешный запрос агента (batch или heartbeat). «Последняя синхронизация» —
+  ТОЛЬКО когда последний присланный пакет был принят целиком, без единого отклонённого события; если
+  часть пакета отклонена, эта метка не обновляется, а причина видна в «Ошибка приёма». «Ждёт отправки» —
+  события, которые агент ещё повторит сам (сеть/не пришло подтверждение). «Отклонено» — события, которые
+  центр явно счёл невалидными: автоматически они больше не повторяются, агенту нужен ручной
+  <code>agent_sync.py --retry-failed</code> после исправления причины.
+</p>
 
 <div class="table-scroll">
 <table>
   <tr>
     <th>Площадка</th><th>Сервер</th><th>Статус</th><th>Версия агента</th>
-    <th>Последний heartbeat</th><th>Последняя синхронизация</th><th>Ждёт отправки</th>
-    <th>Последняя ошибка</th><th>Принтеров</th><th>Заданий сегодня</th><th></th>
+    <th>Последний контакт</th><th>Последний heartbeat</th><th>Последняя синхронизация</th>
+    <th>Ждёт отправки</th><th>Отклонено</th>
+    <th>Ошибка агента</th><th>Ошибка приёма</th><th>Принтеров</th><th>Заданий сегодня</th><th></th>
   </tr>
   {% for row in rows %}
   {% set server = row.server %}
@@ -21,10 +30,13 @@
     <td>{{ server.display_name or server.server_name }}</td>
     <td><span class="status-{{ row.status }}">{{ row.status }}</span></td>
     <td>{{ server.agent_version or "" }}</td>
+    <td>{{ server.last_contact_at.strftime("%Y-%m-%d %H:%M:%S") if server.last_contact_at else "никогда" }}</td>
     <td>{{ server.last_heartbeat_at.strftime("%Y-%m-%d %H:%M:%S") if server.last_heartbeat_at else "никогда" }}</td>
     <td>{{ server.last_sync_at.strftime("%Y-%m-%d %H:%M:%S") if server.last_sync_at else "никогда" }}</td>
     <td>{{ server.pending_queue_size if server.pending_queue_size is not none else "" }}</td>
+    <td>{% if server.failed_queue_size %}<span class="status-warning">{{ server.failed_queue_size }}</span>{% else %}{{ server.failed_queue_size if server.failed_queue_size is not none else "" }}{% endif %}</td>
     <td>{{ server.last_error or "" }}</td>
+    <td>{{ server.last_ingest_error or "" }}</td>
     <td>{{ row.printer_count }}</td>
     <td>{{ row.jobs_today }}</td>
     <td class="actions-inline">
@@ -48,7 +60,7 @@
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="11" class="empty-state">Print Server пока не зарегистрированы</td></tr>
+  <tr><td colspan="14" class="empty-state">Print Server пока не зарегистрированы</td></tr>
   {% endfor %}
 </table>
 </div>

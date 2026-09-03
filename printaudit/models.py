@@ -457,7 +457,19 @@ class PrintServer(Base):
 
     `token_hash` — SHA-256 сырого токена агента (см. printaudit.security.agent_tokens);
     сам токен НИКОГДА не хранится и показывается администратору только один
-    раз, в момент создания регистрации/ротации (см. webapp/print_servers_routes.py)."""
+    раз, в момент создания регистрации/ротации (см. webapp/print_servers_routes.py).
+
+    Про last_contact_at/last_sync_at/last_ingest_error (см. webapp/agent_api.py):
+      - last_contact_at обновляется на КАЖДЫЙ успешно аутентифицированный
+        запрос (batch ИЛИ heartbeat) — "агент достучался и токен верный".
+      - last_sync_at обновляется ТОЛЬКО когда весь пакет /events/batch
+        обработан без единого rejected события (inserted/duplicate — оба
+        считаются успехом). Если хотя бы одно событие отклонено, last_sync_at
+        не трогается, а причина — в last_ingest_error.
+      - last_error — то, что САМ агент сообщил о себе через heartbeat
+        (например, ошибка отправки на его стороне); last_ingest_error —
+        то, что ЦЕНТР обнаружил при разборе присланных данных. Разные поля
+        осознанно, чтобы одно не затирало другое."""
 
     __tablename__ = "print_servers"
 
@@ -469,9 +481,13 @@ class PrintServer(Base):
     agent_version = Column(String(50), nullable=True)
     protocol_version = Column(Integer, nullable=True)
     last_heartbeat_at = Column(DateTime, nullable=True)
+    last_contact_at = Column(DateTime, nullable=True)
     last_sync_at = Column(DateTime, nullable=True)
     pending_queue_size = Column(Integer, nullable=True)
+    # Только терминально отклонённые (не сетевые сбои) — см. OutboxEvent.status.
+    failed_queue_size = Column(Integer, nullable=True)
     last_error = Column(Text, nullable=True)
+    last_ingest_error = Column(Text, nullable=True)
     is_disabled = Column(Boolean, nullable=False, default=False)
     token_hash = Column(String(128), nullable=True)
     token_created_at = Column(DateTime, nullable=True)

@@ -27,6 +27,17 @@ PROTOCOL_VERSION = 1
 AGENT_VERSION = "1.0"
 
 
+class InvalidAppModeError(RuntimeError):
+    """APP_MODE задан (не пуст), но не входит в VALID_MODES — почти всегда
+    опечатка в .env. Раньше это молча превращалось в "standalone", то есть
+    опечатка в production-конфиге незаметно меняла режим работы всего
+    приложения (например, реально настроенный central тихо переставал
+    принимать события от агентов). Теперь — fail fast, как и
+    InsecureSessionSecretError в printaudit.ad_settings: приложение/скрипт
+    должны явно отказаться работать, а не догадываться, что имел в виду
+    администратор."""
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     val = os.environ.get(name)
     if val is None:
@@ -49,9 +60,20 @@ class AgentSettings:
 
 
 def get_agent_settings() -> AgentSettings:
-    mode = os.environ.get("APP_MODE", MODE_STANDALONE).strip().lower() or MODE_STANDALONE
-    if mode not in VALID_MODES:
+    raw_mode = os.environ.get("APP_MODE")
+    if raw_mode is None or not raw_mode.strip():
+        # Переменная вообще не задана — это НЕ ошибка, обычный standalone
+        # по умолчанию (обратная совместимость с деплоями без .env-строки
+        # APP_MODE вообще).
         mode = MODE_STANDALONE
+    else:
+        mode = raw_mode.strip().lower()
+        if mode not in VALID_MODES:
+            raise InvalidAppModeError(
+                f"APP_MODE={raw_mode!r} — недопустимое значение. "
+                f"Допустимые значения: {', '.join(VALID_MODES)}. "
+                "Проверьте .env: похоже на опечатку."
+            )
     return AgentSettings(
         mode=mode,
         central_base_url=(os.environ.get("CENTRAL_BASE_URL") or None),

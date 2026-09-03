@@ -17,11 +17,23 @@
   .\deploy\run_webapp.ps1
   .\deploy\run_webapp.ps1 -Port 8080
   .\deploy\run_webapp.ps1 -PythonExe "C:\Python311\python.exe"
+  # За реверс-прокси (nginx/IIS), терминирующим TLS -- см. .env.example про
+  # TRUSTED_PROXY_IPS (это основная проверка, работает и под TestClient) и
+  # опционально ещё и встроенный в uvicorn -ForwardedAllowIps (доп. слой,
+  # переписывает scope["scheme"] ДО того, как ASGI-приложение вообще его
+  # увидит; не подменяет TRUSTED_PROXY_IPS, а дополняет):
+  .\deploy\run_webapp.ps1 -ForwardedAllowIps "127.0.0.1"
 #>
 param(
     [string]$RepoRoot = (Resolve-Path "$PSScriptRoot\..").Path,
     [int]$Port = 8000,
-    [string]$PythonExe = (Join-Path (Resolve-Path "$PSScriptRoot\..").Path ".venv\Scripts\python.exe")
+    [string]$PythonExe = (Join-Path (Resolve-Path "$PSScriptRoot\..").Path ".venv\Scripts\python.exe"),
+    # IP(-а через запятую) реверс-прокси, которому uvicorn сам может доверять
+    # X-Forwarded-Proto/X-Forwarded-For (флаги --proxy-headers
+    # --forwarded-allow-ips) -- см. .env.example про TRUSTED_PROXY_IPS,
+    # это ДОПОЛНИТЕЛЬНЫЙ, не обязательный слой той же защиты. Пусто -- эти
+    # флаги uvicorn не передаются вообще.
+    [string]$ForwardedAllowIps = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,4 +67,9 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Set-Location $RepoRoot
-& $PythonExe -m uvicorn webapp.main:app --host 0.0.0.0 --port $Port
+if ($ForwardedAllowIps) {
+    & $PythonExe -m uvicorn webapp.main:app --host 0.0.0.0 --port $Port `
+        --proxy-headers --forwarded-allow-ips $ForwardedAllowIps
+} else {
+    & $PythonExe -m uvicorn webapp.main:app --host 0.0.0.0 --port $Port
+}
