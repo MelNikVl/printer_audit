@@ -343,9 +343,13 @@ class AdDepartmentRule(Base):
 class PrinterQueue(Base):
     """Одна очередь печати. `printer_name` больше НЕ уникально глобально —
     одинаковое имя очереди легко повторяется на разных площадках/серверах
-    (например, "HP-3F-BW" на двух объектах). Уникальность теперь —
-    (print_server_id, printer_name), см. uq_printer_queues_server_name;
-    print_server_id nullable по той же причине, что и в PrintJob (см. её
+    (например, "HP-3F-BW" на двух объектах) — и то же самое верно для
+    endpoint-агентов: одинаковая модель USB-принтера на разных ПК часто
+    называется идентично Windows'ом. Уникальность теперь —
+    (print_server_id, printer_name) ДЛЯ очередей Print Server и
+    (endpoint_agent_id, printer_name) ДЛЯ локальных принтеров endpoint-
+    агента — ровно ОДНО из двух полей заполнено, никогда оба сразу (тот же
+    принцип, что и у PrintJob.print_server_id/endpoint_agent_id, см. её
     docstring и docs/MULTISITE_ARCHITECTURE.md)."""
 
     __tablename__ = "printer_queues"
@@ -353,6 +357,7 @@ class PrinterQueue(Base):
     id = Column(Integer, primary_key=True)
     printer_name = Column(String(200), nullable=False, index=True)
     print_server_id = Column(Integer, ForeignKey("print_servers.id"), nullable=True, index=True)
+    endpoint_agent_id = Column(Integer, ForeignKey("endpoint_agents.id"), nullable=True, index=True)
     display_name = Column(String(200), nullable=True)
     server_name = Column(String(200), nullable=True)
     share_name = Column(String(200), nullable=True)
@@ -386,9 +391,11 @@ class PrinterQueue(Base):
     updated_at = Column(DateTime, nullable=False, default=_utcnow, onupdate=_utcnow)
 
     print_server = relationship("PrintServer")
+    endpoint_agent = relationship("EndpointAgent")
 
     __table_args__ = (
         UniqueConstraint("print_server_id", "printer_name", name="uq_printer_queues_server_name"),
+        UniqueConstraint("endpoint_agent_id", "printer_name", name="uq_printer_queues_endpoint_name"),
     )
 
 
