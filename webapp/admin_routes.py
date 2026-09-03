@@ -43,6 +43,7 @@ from printaudit.models import (
     SyncRun,
 )
 from printaudit.models import User as LegacyUser
+from printaudit.monitoring.device_queries import dashboard_summary
 from printaudit.printers.discovery import PrinterDiscoveryError, sync_printer_queues
 from printaudit.printers.resolver import resolve_price
 from printaudit.security.agent_tokens import generate_agent_token, hash_agent_token
@@ -98,6 +99,7 @@ def admin_overview(
         db.query(SyncRun).filter_by(status="failed").order_by(SyncRun.started_at.desc()).limit(5).all()
     )
     collector_states = db.query(CollectorState).all()
+    monitoring_summary = dashboard_summary(db)
 
     return templates.TemplateResponse(
         "admin/overview.html",
@@ -118,6 +120,7 @@ def admin_overview(
             "last_collector_run": last_collector_run,
             "collector_states": collector_states,
             "recent_failed_runs": recent_failed_runs,
+            "monitoring_summary": monitoring_summary,
         },
     )
 
