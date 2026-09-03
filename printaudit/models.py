@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -859,4 +860,30 @@ class ForecastRun(Base):
 
     __table_args__ = (
         UniqueConstraint("scope_type", "scope_id", "metric", "horizon_days", name="uq_forecast_run"),
+    )
+
+
+class PrinterSupplyDailyAgg(Base):
+    """Дневной агрегат уровня расходника — переживает retention-очистку
+    сырых printer_supply_samples (см. printaudit.monitoring.retention):
+    сырые 5-минутные сэмплы хранятся ограниченный период, но компактный
+    дневной тренд (мин/среднее/макс) остаётся надолго — этого достаточно и
+    для UI-графика за 90 дней, и для прогноза даты исчерпания тонера."""
+
+    __tablename__ = "printer_supply_daily_agg"
+
+    id = Column(Integer, primary_key=True)
+    printer_device_id = Column(Integer, ForeignKey("printer_devices.id"), nullable=False, index=True)
+    supply_type = Column(String(40), nullable=False)
+    day = Column(Date, nullable=False, index=True)
+    min_level_percent = Column(Float, nullable=True)
+    avg_level_percent = Column(Float, nullable=True)
+    max_level_percent = Column(Float, nullable=True)
+    sample_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=_utcnow)
+
+    printer_device = relationship("PrinterDevice")
+
+    __table_args__ = (
+        UniqueConstraint("printer_device_id", "supply_type", "day", name="uq_supply_daily_agg"),
     )
