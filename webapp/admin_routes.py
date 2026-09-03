@@ -34,6 +34,7 @@ from printaudit.models import (
     AppUser,
     CollectorState,
     Department,
+    EndpointAgent,
     PriceRule,
     PrinterQueue,
     PrintJob,
@@ -1025,3 +1026,128 @@ def admin_print_servers_enable(
     )
     db.commit()
     return _redirect("/admin/print-servers", msg=f"Print Server «{server.server_name}» включён")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-агенты (USB/прямая печать на пользовательских ПК) — ЛОКАЛЬНЫЙ
+# раздел площадки (standalone/agent), не завязан на APP_MODE=central, см.
+# webapp/endpoint_api.py и docs/PRINTER_MONITORING_FORECASTING.md.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/endpoint-agents")
+def admin_endpoint_agents(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    agents = db.query(EndpointAgent).order_by(EndpointAgent.hostname).all()
+    today_start = naive_utc(utcnow()).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = []
+    for agent in agents:
+        jobs_today = (
+            db.query(func.count(PrintJob.id))
+            .filter(PrintJob.endpoint_agent_id == agent.id, PrintJob.time_created >= today_start)
+            .scalar()
+            or 0
+        )
+        rows.append({"agent": agent, "status": compute_status(agent), "jobs_today": jobs_today})
+    return templates.TemplateResponse(
+        "admin/endpoint_agents.html",
+        {"request": request, "current_user": current_user, "csrf_token": csrf_token(request), "rows": rows},
+    )
+
+
+@router.post("/endpoint-agents/create", dependencies=[Depends(require_csrf)])
+def admin_endpoint_agents_create(
+    request: Request,
+    hostname: str = Form(...), display_name: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    hostname = hostname.strip()
+    if not hostname:
+        return _redirect("/admin/endpoint-agents", err="Имя компьютера обязательно")
+
+    settings = get_settings()
+    site = db.query(Site).filter_by(site_code=settings.site_code).first()
+    if site is None:
+        return _redirect(
+            "/admin/endpoint-agents",
+            err="Локальная площадка ещё не создана — запустите сборщик хотя бы раз (он заводит её сам).",
+        )
+    if db.query(EndpointAgent).filter_by(site_id=site.id, hostname=hostname).first():
+        return _redirect("/admin/endpoint-agents", err=f"Endpoint-агент «{hostname}» уже зарегистрирован")
+
+    raw_token = generate_agent_token()
+    agent = EndpointAgent(
+        site_id=site.id, hostname=hostname, display_name=display_name.strip() or hostname,
+        token_hash=hash_agent_token(raw_token), token_created_at=utcnow(),
+    )
+    db.add(agent)
+    db.flush()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="endpoint_agent.create", object_type="endpoint_agent",
+        object_id=agent.id, new_value={"hostname": hostname}, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect(
+        "/admin/endpoint-agents",
+        msg=(
+            f"Endpoint-агент «{hostname}» зарегистрирован. Токен (показывается один раз, "
+            f"скопируйте в .env агента): {raw_token}"
+        ),
+    )
+
+
+@router.post("/endpoint-agents/{agent_id}/rotate-token", dependencies=[Depends(require_csrf)])
+def admin_endpoint_agents_rotate_token(
+    agent_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    agent = db.get(EndpointAgent, agent_id)
+    if agent is None:
+        return _redirect("/admin/endpoint-agents", err="Endpoint-агент не найден")
+    raw_token = generate_agent_token()
+    agent.token_hash = hash_agent_token(raw_token)
+    agent.token_rotated_at = utcnow()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="endpoint_agent.rotate_token", object_type="endpoint_agent",
+        object_id=agent.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect(
+        "/admin/endpoint-agents",
+        msg=f"Токен для «{agent.hostname}» перевыпущен (старый недействителен). Новый (один раз): {raw_token}",
+    )
+
+
+@router.post("/endpoint-agents/{agent_id}/disable", dependencies=[Depends(require_csrf)])
+def admin_endpoint_agents_disable(
+    agent_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    agent = db.get(EndpointAgent, agent_id)
+    if agent is None:
+        return _redirect("/admin/endpoint-agents", err="Endpoint-агент не найден")
+    agent.is_disabled = True
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="endpoint_agent.disable", object_type="endpoint_agent",
+        object_id=agent.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/endpoint-agents", msg=f"«{agent.hostname}» отключён — токен больше не принимается")
+
+
+@router.post("/endpoint-agents/{agent_id}/enable", dependencies=[Depends(require_csrf)])
+def admin_endpoint_agents_enable(
+    agent_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    agent = db.get(EndpointAgent, agent_id)
+    if agent is None:
+        return _redirect("/admin/endpoint-agents", err="Endpoint-агент не найден")
+    agent.is_disabled = False
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="endpoint_agent.enable", object_type="endpoint_agent",
+        object_id=agent.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/endpoint-agents", msg=f"«{agent.hostname}» включён")

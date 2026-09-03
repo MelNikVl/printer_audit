@@ -1,0 +1,63 @@
+{% extends "admin/base_admin.html" %}
+{% block admin_content %}
+<h1>Endpoint-агенты (USB / прямая печать)</h1>
+<p class="muted">
+  Endpoint-агент — служба на пользовательском ПК, учитывающая печать через USB/WSD/прямые IP-принтеры, которые НЕ
+  проходят через Print Server. Токен показывается только один раз — при регистрации или ротации; в БД хранится
+  только его хэш. Регистрация — ЛОКАЛЬНАЯ для этой площадки (не видна на центральном сервере напрямую — задания
+  этих агентов попадают в центр как обычные print_jobs).
+</p>
+
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>Компьютер</th><th>Статус</th><th>Версия агента</th>
+    <th>Последний контакт</th><th>Последняя синхронизация</th>
+    <th>Ждёт отправки</th><th>Отклонено</th><th>Ошибка</th><th>Заданий сегодня</th><th></th>
+  </tr>
+  {% for row in rows %}
+  {% set agent = row.agent %}
+  <tr>
+    <td>{{ agent.display_name or agent.hostname }}</td>
+    <td><span class="status-{{ row.status }}">{{ row.status }}</span></td>
+    <td>{{ agent.agent_version or "" }}</td>
+    <td>{{ agent.last_contact_at.strftime("%Y-%m-%d %H:%M:%S") if agent.last_contact_at else "никогда" }}</td>
+    <td>{{ agent.last_sync_at.strftime("%Y-%m-%d %H:%M:%S") if agent.last_sync_at else "никогда" }}</td>
+    <td>{{ agent.pending_queue_size if agent.pending_queue_size is not none else "" }}</td>
+    <td>{{ agent.failed_queue_size if agent.failed_queue_size is not none else "" }}</td>
+    <td>{{ agent.last_error or "" }}</td>
+    <td>{{ row.jobs_today }}</td>
+    <td class="actions-inline">
+      <form method="post" action="/admin/endpoint-agents/{{ agent.id }}/rotate-token" class="inline-form"
+            onclick="return confirm('Перевыпустить токен для «{{ agent.hostname }}»? Старый токен сразу перестанет работать.')">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Перевыпустить токен</button>
+      </form>
+      {% if agent.is_disabled %}
+      <form method="post" action="/admin/endpoint-agents/{{ agent.id }}/enable" class="inline-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Включить</button>
+      </form>
+      {% else %}
+      <form method="post" action="/admin/endpoint-agents/{{ agent.id }}/disable" class="inline-form"
+            onclick="return confirm('Отключить «{{ agent.hostname }}»?')">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn-danger">Отключить</button>
+      </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="10" class="empty-state">Endpoint-агенты пока не зарегистрированы</td></tr>
+  {% endfor %}
+</table>
+</div>
+
+<h2>Новая регистрация</h2>
+<form class="filters" method="post" action="/admin/endpoint-agents/create">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div><label>Имя компьютера</label><input type="text" name="hostname" required placeholder="ACCOUNTING-PC-07"></div>
+  <div><label>Отображаемое имя</label><input type="text" name="display_name"></div>
+  <button type="submit">Зарегистрировать и выдать токен</button>
+</form>
+{% endblock %}
