@@ -97,10 +97,31 @@ SNMP его нет, поэтому используется `external_id = alert
 
 ### Прямой SNMP (`direct_snmp`)
 
-- **SNMPv3 предпочтителен** (аутентификация+шифрование); community-based
-  v2c — только если устройство не поддерживает v3. Учётные данные — в
-  `.env` (`SnmpProfile.credentials_env_var` указывает НА ИМЯ переменной
-  окружения, не хранит сам секрет в БД/config.yaml).
+- **SNMPv3 (USM) полностью реализован**, не только заявлен полем в модели:
+  `SnmpProfile.snmp_version="v3"` (значение по умолчанию) требует
+  `snmp_v3_username` и, опционально, протокол+ключ аутентификации
+  (`snmp_v3_auth_protocol` — `MD5`/`SHA`/`SHA224`/`SHA256`/`SHA384`/`SHA512`,
+  ключ — через `snmp_v3_auth_key_env_var`) и протокол+ключ приватности
+  (`snmp_v3_priv_protocol` — `DES`/`3DES`/`AES`/`AES192`/`AES256`, ключ —
+  через `snmp_v3_priv_key_env_var`; privacy без authentication запрещена
+  самим протоколом SNMPv3/USM, не только нашим кодом). Управляется в
+  **`/admin/snmp-profiles`**.
+- `snmp_version="v2c"` — явный legacy-режим для устройств, не
+  поддерживающих v3 (community читается из переменной окружения, имя
+  которой — в `SnmpProfile.credentials_env_var`); это осознанный выбор
+  администратора КОНКРЕТНОГО профиля, не тихий дефолт приложения.
+- Сами секреты (community/auth key/priv key) — **только** в `.env`,
+  `SnmpProfile` хранит лишь ИМЕНА переменных окружения, не значения (см.
+  `printaudit.monitoring.snmp_adapter.resolve_snmp_security`).
+- **Нет никакого неявного fallback.** Если для выбранной версии не хватает
+  обязательного поля/переменной окружения (например,
+  `snmp_v3_auth_key_env_var` не задан или переменная, на которую он
+  указывает, пуста) — `resolve_snmp_security` бросает `SnmpConfigError` с
+  понятным сообщением, и опрос ЭТОГО устройства завершается ошибкой (видно
+  в `logs/monitor_printers.log`, `MonitoringRun.devices_failed`), а не
+  тихо опрашивает с `community="public"`. Один неправильно настроенный
+  профиль не проваливает весь прогон по площадке (см.
+  `collector/monitor_printers.py::_poll_snmp_devices`).
 - Базовый набор OID — Printer-MIB (`DEFAULT_OIDS` в `snmp_adapter.py`),
   вендор-специфичные добавляются через `SnmpProfile.oid_map_json`
   (мержится поверх дефолтов, невалидный JSON — понятная ошибка, не
@@ -116,7 +137,10 @@ SNMP его нет, поэтому используется `external_id = alert
   одном `zabbix_api` её не устанавливают. Реальный SNMP-запрос
   (`_default_snmp_get`) импортирует `pysnmp` лениво, внутри
   `try/except ImportError`, с понятным сообщением, если библиотека не
-  установлена.
+  установлена. Тестируется через инъекцию `getter`/фейковых профилей
+  (`tests/test_snmp_adapter.py`) — без реального SNMP/железа; сама сборка
+  pysnmp-объектов безопасности (`CommunityData`/`UsmUserData`) не покрыта
+  тестами напрямую (нет pysnmp/железа в CI), только логика конфигурации.
 
 ## 4. Хранение истории и retention
 
@@ -153,11 +177,30 @@ outbox с pending/failed/retry, см.
 мониторинговые данные синхронизируются по курсору
 (`MonitoringSyncState`, одна строка на площадку): `last_health_sample_id`/
 `last_counter_sample_id`/`last_supply_sample_id` (по id — эти таблицы
-только INSERT, id монотонно растёт) и `last_alert_synced_at` (по времени —
-алерты ещё и обновляются при resolve). Это осознанное упрощение: приём на
-центре уже идемпотентен по уникальным ключам таблиц (тот же принцип, что и
-для заданий печати), а курсор продвигается ТОЛЬКО после подтверждённого
-200 — значит полноценная per-row машина состояний тут просто не нужна.
+только INSERT, id монотонно растёт) и СОСТАВНОЙ курсор
+`(last_alert_synced_at, last_alert_synced_id)` для алертов (по одному
+`updated_at` недостаточно: несколько алертов одного опроса нередко
+получают ОДИНАКОВЫЙ `updated_at`, и при лимите пакета меньше их числа
+курсор по одному времени продвинулся бы мимо ещё не отправленных строк с
+тем же значением — они терялись бы навсегда; `id` как вторая часть ключа
+устраняет эту неоднозначность, см. `collector/agent_sync.py::
+_build_monitoring_payload` и регрессионный тест
+`tests/test_agent_sync_monitoring.py::test_alert_cursor_survives_multiple_alerts_with_identical_updated_at`).
+
+Приём на центре уже идемпотентен по уникальным ключам таблиц (тот же
+принцип, что и для заданий печати) — это оправдывает курсор вместо
+полноценной per-row машины состояний, но с одной оговоркой: центр
+коммитит принятые и отклонённые элементы пакета ОДНОЙ транзакцией и
+возвращает 200 с общим числом `rejected`, БЕЗ per-item ack'ов (в отличие
+от `/events/batch` для заданий печати, где `results` называет каждый
+`record_id` отдельно). Раз нет способа узнать, какие именно элементы
+отклонены, курсор продвигается ТОЛЬКО когда ответ 200 И `rejected == 0` —
+при `rejected > 0` НИ ОДИН курсор не трогается, весь пакет уходит целиком
+повторно при следующей синхронизации (уже принятые элементы при повторе
+идемпотентно определяются центром как `duplicate`, не как ошибка). См.
+`collector/agent_sync.py::sync_monitoring_data` и
+`tests/test_agent_sync_monitoring.py::test_sync_partial_reject_does_not_advance_cursor_and_retries_next_run`.
+
 Устройства пересылаются целиком при каждой отправке (дёшево — обычно
 десятки-сотни на площадку), это гарантирует, что центр узнает об
 устройстве до первого сэмпла на него.
@@ -188,6 +231,14 @@ outbox с pending/failed/retry, см.
   проблемами. Print Audit намеренно НЕ дублирует полноценную систему
   алертинга Zabbix — его задача здесь: связать техническое состояние с
   реальной печатью, затраты и прогноз, а не быть second-мониторингом.
+- **`/admin/snmp-profiles`** — управление профилями SNMP (см. Часть 3
+  выше): создание/редактирование v3 (username, auth/priv протокол и
+  имена переменных окружения с ключами) или явного legacy v2c (имя
+  переменной окружения с community), включение/отключение профиля.
+  Валидация конфигурации (обязательность username для v3, запрет privacy
+  без authentication, обязательность env-переменной там, где указан
+  протокол) происходит сразу при сохранении — до первого реального
+  опроса устройства (`printaudit.monitoring.snmp_profiles`).
 
 Запрос `printaudit/monitoring/device_queries.py` держит "последний сэмпл на
 устройство" через `GROUP BY max(id)` + `JOIN` (портируемо между
@@ -420,6 +471,8 @@ SQLite/PostgreSQL, AD и локальная авторизация, RBAC/CSRF, �
 | `aeb97b6d88e4` | `printer_supply_daily_agg` |
 | `ee90f44a0772` | `monitoring_sync_state` |
 | `cca38199a688` | `printer_queues.endpoint_agent_id` + `uq_printer_queues_endpoint_name` |
+| `7c9d3e1a5b02` | `snmp_profiles.snmp_v3_username`/`.snmp_v3_auth_protocol`/`.snmp_v3_auth_key_env_var`/`.snmp_v3_priv_protocol`/`.snmp_v3_priv_key_env_var` (реальные SNMPv3 USM-поля) |
+| `b4f68a2c9d17` | `monitoring_sync_state.last_alert_synced_id` (составной курсор алертов вместе с `last_alert_synced_at`) |
 
 ## 11. Тесты
 
@@ -431,10 +484,11 @@ endpoint-агент читает Windows Event Log через инжектиру
 |---|---|
 | `test_printer_devices.py` | Создание устройств, аудит, связывание/отвязывание очередей (relink переиспользует строку), `compute_device_status`, `classify_supply_level` |
 | `test_monitoring_ingest.py` | Идемпотентная запись сэмплов, unsupported OID = unknown не 0, реконсиляция алертов (открыть/оставить/закрыть/**переоткрыть**) |
-| `test_zabbix_adapter.py`, `test_snmp_adapter.py` | Нормализация, отсутствующий item/OID не задаёт 0, одна плохая метрика не валит весь опрос, токен не в логах |
-| `test_monitor_printers.py` | Опрашиваются только zabbix/snmp устройства, одно упавшее не останавливает остальные |
+| `test_zabbix_adapter.py`, `test_snmp_adapter.py` | Нормализация, отсутствующий item/OID не задаёт 0, одна плохая метрика не валит весь опрос, токен/секреты не в логах; `resolve_snmp_security` — v3 (noAuthNoPriv/authNoPriv/authPriv), явный v2c, отсутствие обязательной переменной окружения НЕ даёт fallback на `community="public"` |
+| `test_monitoring_snmp_profiles.py`, `test_admin_snmp_profiles.py` | CRUD профилей SNMP с валидацией (username обязателен для v3, priv без auth запрещён, community-переменная обязательна для v2c), аудит, RBAC страницы `/admin/snmp-profiles` |
+| `test_monitor_printers.py` | Опрашиваются только zabbix/snmp устройства, одно упавшее не останавливает остальные (в т.ч. устройство с неполным/неверным SNMP-профилем — `SnmpConfigError` не роняет весь прогон площадки) |
 | `test_monitoring_retention.py` | Агрегация ДО удаления, идемпотентность, активные алерты не удаляются |
-| `test_agent_monitoring_api.py`, `test_agent_sync_monitoring.py` | Приём на центре с версионированием протокола и cross-site защитой, курсор синхронизации |
+| `test_agent_monitoring_api.py`, `test_agent_sync_monitoring.py` | Приём на центре с версионированием протокола и cross-site защитой; курсор синхронизации НЕ продвигается при `rejected > 0` (регрессия, весь пакет повторяется, принятые элементы становятся `duplicate`); составной курсор алертов `(updated_at, id)` устойчив к нескольким алертам с одинаковым `updated_at` при лимите страницы меньше их числа |
 | `test_endpoint_agent_*.py` (7 файлов) | Конфигурация, классификация портов (USB/WSD/IP vs сетевая очередь), захват событий, локальная очередь, HTTP-клиент, полный цикл (`runner.py`), **сквозной сценарий** против реального `webapp/endpoint_api.py` |
 | `test_endpoint_api.py` | Приём заданий endpoint-агента на сервере площадки, изоляция очередей от Print Server, outbox только в agent-режиме |
 | `test_monitoring_device_queries.py`, `test_printers_page.py` | Список/карточка устройства, фильтры, central-дашборд |

@@ -224,10 +224,11 @@ python scripts\bootstrap_superadmin.py --login "DOMAIN\ivanov"
 
 - **Техническое состояние устройств** (`/printers`, `/printers/{id}`,
   карточки на `/admin`): подключите принтеры к Zabbix (если уже есть на
-  площадке) или настройте прямой SNMP-опрос — `.env`
-  (`ZABBIX_API_URL`/`ZABBIX_API_TOKEN` или SNMP-профиль), заведите
-  `PrinterDevice` и свяжите с очередями в админке, зарегистрируйте задачу
-  опроса: `.\deploy\register_monitor_printers_task.ps1`.
+  площадке — `ZABBIX_API_URL`/`ZABBIX_API_TOKEN` в `.env`) или настройте
+  прямой SNMP-опрос (создайте профиль в `/admin/snmp-profiles` — SNMPv3
+  рекомендуется, сами ключи — в `.env` площадки), заведите `PrinterDevice`
+  и свяжите с очередями в админке, зарегистрируйте задачу опроса:
+  `.\deploy\register_monitor_printers_task.ps1`.
 - **USB/прямая печать на пользовательских ПК**: зарегистрируйте компьютер
   в `/admin/endpoint-agents` на сервере площадки, установите endpoint-агент
   как службу Windows: `.\deploy\install_endpoint_agent.ps1` (см.
