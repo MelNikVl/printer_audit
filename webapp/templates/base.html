@@ -3,42 +3,53 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Print Audit{% if site_code %} — {{ site_code }}{% endif %}</title>
+<title>Print Management v. 02{% if site_code %} — {{ site_code }}{% endif %}</title>
 <link rel="stylesheet" href="/static/style.css">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 </head>
 <body>
-<nav>
-  <a href="/">Дашборд</a>
-  <a href="/by-department">По отделам</a>
-  <a href="/by-user">По пользователям</a>
-  <a href="/by-printer">По принтерам</a>
-  <a href="/print-jobs">Журнал заданий</a>
-  <a href="/printers">Принтеры</a>
-  <a href="/export">Экспорт CSV</a>
-  {% if current_user and current_user.role in ("admin", "superadmin") %}
-  <a href="/admin">Администрирование</a>
-  {% endif %}
-  <span class="nav-spacer"></span>
-  {% if current_user %}
-  {% if current_user.auth_provider == "local" %}
-  <a href="/change-password">Сменить пароль</a>
-  {% endif %}
-  <span class="nav-user">{{ current_user.display_name or current_user.login_normalized }} ({{ current_user.role }})</span>
-  <form method="post" action="/logout" class="nav-logout-form">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <button type="submit">Выйти</button>
-  </form>
-  {% endif %}
-</nav>
-{% if request.query_params.get("msg") %}
-<div class="flash flash-ok">{{ request.query_params.get("msg") }}</div>
-{% endif %}
-{% if request.query_params.get("err") %}
-<div class="flash flash-err">{{ request.query_params.get("err") }}</div>
-{% endif %}
-<main>
-{% block content %}{% endblock %}
-</main>
+<div class="app-shell">
+  <aside class="app-sidebar">
+    <a class="app-brand" href="/">
+      <span>Print Management</span>
+      <small>v. 02</small>
+    </a>
+    <nav class="sidebar-nav" aria-label="Основное меню">
+      <a href="/" class="{% if request.url.path == '/' or request.url.path == '/by-user' %}active{% endif %}">Дашборд</a>
+      <a href="/by-department" class="{% if request.url.path == '/by-department' %}active{% endif %}">По отделам</a>
+      <a href="/by-printer" class="{% if request.url.path == '/by-printer' %}active{% endif %}">По принтерам</a>
+      <a href="/print-jobs" class="{% if request.url.path == '/print-jobs' %}active{% endif %}">Журнал заданий</a>
+      <a href="/printers" class="{% if request.url.path.startswith('/printers') %}active{% endif %}">Мониторинг принтеров</a>
+      <a href="/export">Экспорт CSV</a>
+      {% if current_user and current_user.role in ("admin", "superadmin") %}
+      <a href="/admin" class="{% if request.url.path.startswith('/admin') %}active{% endif %}">Администрирование</a>
+      {% endif %}
+    </nav>
+  </aside>
+
+  <div class="app-content">
+    <header class="app-topbar">
+      {% if current_user %}
+      <span class="nav-user">{{ current_user.display_name or current_user.login_normalized }} ({{ current_user.role }})</span>
+      {% if current_user.auth_provider == "local" %}
+      <a href="/change-password">Сменить пароль</a>
+      {% endif %}
+      <form method="post" action="/logout" class="nav-logout-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">Выйти</button>
+      </form>
+      {% endif %}
+    </header>
+    {% if request.query_params.get("msg") %}
+    <div class="flash flash-ok">{{ request.query_params.get("msg") }}</div>
+    {% endif %}
+    {% if request.query_params.get("err") %}
+    <div class="flash flash-err">{{ request.query_params.get("err") }}</div>
+    {% endif %}
+    <main>
+    {% block content %}{% endblock %}
+    </main>
+  </div>
+</div>
 </body>
 </html>
