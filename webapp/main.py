@@ -57,7 +57,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Print Audit", lifespan=lifespan)
+app = FastAPI(title="Print Management v. 02", lifespan=lifespan)
 app.add_middleware(CsrfCookieMiddleware)
 app.add_middleware(agent_api.MaxBodySizeMiddleware)
 app.add_middleware(endpoint_api.MaxEndpointBodySizeMiddleware)
@@ -166,32 +166,25 @@ def date_filters(date_from: Optional[str], date_to: Optional[str]):
 @app.get("/")
 def dashboard(
     request: Request,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     site_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_login),
 ):
-    settings = get_settings()
-    start, end = queries.month_bounds()
-    t = queries.totals(db, date_from=start, date_to=end, site_id=site_id)
-    top_depts = queries.by_department(db, date_from=start, date_to=end, site_id=site_id)[:5]
-    top_users = queries.by_user(db, date_from=start, date_to=end, site_id=site_id)[:5]
+    """Главная страница: тот же отчёт по пользователям, что и /by-user."""
+    d_from, d_to, df, dt = date_filters(date_from, date_to)
+    rows = queries.by_user(db, date_from=d_from, date_to=d_to, site_id=site_id)
+    totals = queries.totals(db, date_from=d_from, date_to=d_to, site_id=site_id)
     return templates.TemplateResponse(
-        "dashboard.html",
+        "by_user.html",
         {
-            "request": request,
-            "current_user": current_user,
-            "csrf_token": csrf_token(request),
-            "site_code": settings.site_code,
-            "site_id": site_id,
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "rows": rows, "totals": totals, "date_from": df, "date_to": dt,
+            "currency": get_settings().currency, "site_id": site_id,
             "sites": db.query(Site).order_by(Site.name).all(),
-            "totals": t,
-            "top_depts": top_depts,
-            "top_users": top_users,
-            "month_label": start.strftime("%m.%Y"),
-            "currency": settings.currency,
         },
     )
-
 
 @app.get("/by-department")
 def page_by_department(
@@ -226,12 +219,14 @@ def page_by_user(
 ):
     d_from, d_to, df, dt = date_filters(date_from, date_to)
     rows = queries.by_user(db, date_from=d_from, date_to=d_to, department_id=department_id, site_id=site_id)
+    totals = queries.totals(db, date_from=d_from, date_to=d_to, site_id=site_id)
     return templates.TemplateResponse(
         "by_user.html",
         {
             "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
-            "rows": rows, "date_from": df, "date_to": dt, "currency": get_settings().currency,
-            "site_id": site_id, "sites": db.query(Site).order_by(Site.name).all(),
+            "rows": rows, "totals": totals, "date_from": df, "date_to": dt,
+            "currency": get_settings().currency, "site_id": site_id,
+            "sites": db.query(Site).order_by(Site.name).all(),
         },
     )
 
