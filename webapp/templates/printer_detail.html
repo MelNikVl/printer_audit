@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+{% block content %}
+{% set d = detail.device %}
+<h1>{{ d.display_name }} <span class="status-{{ detail.status }}">({{ detail.status }})</span></h1>
+<p class="muted">
+  Площадка: {{ d.site.name if d.site else "" }} ·
+  {% if d.monitoring_source == "zabbix_api" %}<span class="badge badge-active">Zabbix</span>
+  {% elif d.monitoring_source == "direct_snmp" %}<span class="badge badge-active">SNMP</span>
+  {% else %}<span class="badge badge-inactive">{{ d.monitoring_source }}</span>{% endif %}
+  {% if d.vendor or d.model %} · {{ d.vendor or "" }} {{ d.model or "" }}{% endif %}
+  {% if d.ip_address %} · IP: {{ d.ip_address }}{% endif %}
+  {% if d.hostname %} · {{ d.hostname }}{% endif %}
+</p>
+
+<div class="device-card-grid">
+  <div class="device-card-metric"><div class="value">{{ detail.jobs_period }}</div><div class="label">Заданий за 30д</div></div>
+  <div class="device-card-metric"><div class="value">{{ detail.pages_period }}</div><div class="label">Страниц за 30д</div></div>
+  <div class="device-card-metric"><div class="value">{{ detail.alerts | selectattr("resolved_at", "none") | list | length }}</div><div class="label">Активных ошибок</div></div>
+  <div class="device-card-metric"><div class="value">{{ detail.linked_queues | length }}</div><div class="label">Связанных очередей</div></div>
+</div>
+
+<h2>Техническое состояние</h2>
+{% if detail.latest_health %}
+<table>
+  <tr><th>Последний опрос</th><td>{{ detail.latest_health.collected_at.strftime("%Y-%m-%d %H:%M:%S") }} ({{ detail.latest_health.source }})</td></tr>
+  <tr><th>Доступность</th><td>{% if detail.latest_health.is_reachable is true %}да{% elif detail.latest_health.is_reachable is false %}нет{% else %}неизвестно{% endif %}</td></tr>
+  <tr><th>Замятие бумаги</th><td>{{ "да" if detail.latest_health.has_paper_jam else ("нет" if detail.latest_health.has_paper_jam is not none else "неизвестно") }}</td></tr>
+  <tr><th>Открыта крышка</th><td>{{ "да" if detail.latest_health.has_cover_open else ("нет" if detail.latest_health.has_cover_open is not none else "неизвестно") }}</td></tr>
+  <tr><th>Нет бумаги</th><td>{{ "да" if detail.latest_health.has_paper_out else ("нет" if detail.latest_health.has_paper_out is not none else "неизвестно") }}</td></tr>
+  <tr><th>Аппаратная ошибка</th><td>{{ "да" if detail.latest_health.has_hardware_error else ("нет" if detail.latest_health.has_hardware_error is not none else "неизвестно") }}</td></tr>
+  {% if detail.latest_health.raw_status_text %}<tr><th>Сырой статус источника</th><td>{{ detail.latest_health.raw_status_text }}</td></tr>{% endif %}
+</table>
+{% else %}
+<p class="empty-state">Нет данных мониторинга для этого устройства.</p>
+{% endif %}
+
+<h2>Расходники</h2>
+{% if detail.supplies %}
+<table>
+  <tr><th>Тип</th><th>Уровень</th><th>Статус</th></tr>
+  {% for s in detail.supplies %}
+  <tr>
+    <td>{{ s.supply_type }}</td>
+    <td>
+      {% if s.level_percent is not none %}
+      {{ "%.0f"|format(s.level_percent) }}%
+      <span class="supply-bar"><span class="supply-bar-fill {{ s.level_status }}" style="width: {{ s.level_percent }}%;"></span></span>
+      {% else %}неизвестно{% endif %}
+    </td>
+    <td>{{ s.level_status or "неизвестно" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="empty-state">Нет данных о расходниках.</p>
+{% endif %}
+
+<h2>Прогноз исчерпания расходников</h2>
+{% if forecasts.toner %}
+<table>
+  <tr><th>Тип</th><th>Дата исчерпания</th><th>Тренд, %/день</th><th>Текущий уровень</th></tr>
+  {% for t in forecasts.toner %}
+  <tr>
+    <td>{{ t.supply_type }}</td>
+    {% if t.insufficient_history %}
+    <td colspan="3" class="muted">Недостаточно данных для прогноза</td>
+    {% else %}
+    <td>{{ t.exhaustion_date }}</td>
+    <td>{{ "%.2f"|format(t.slope_percent_per_day) }}</td>
+    <td>{{ "%.0f"|format(t.current_level_percent) }}%</td>
+    {% endif %}
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="empty-state">Нет истории расходников для прогноза.</p>
+{% endif %}
+
+<h2>Риск простоя</h2>
+{% if forecasts.downtime_risk and not forecasts.downtime_risk.insufficient_history %}
+<p>
+  Уровень риска: <strong class="status-{{ 'offline' if forecasts.downtime_risk.level == 'high' else ('warning' if forecasts.downtime_risk.level == 'medium' else 'online') }}">{{ forecasts.downtime_risk.level }}</strong>
+  · недоступность за 14д: {{ "%.1f"|format(forecasts.downtime_risk.unavailable_ratio * 100) }}%
+  · активных критичных ошибок: {{ forecasts.downtime_risk.active_error_alert_count }}
+</p>
+{% else %}
+<p class="empty-state">Недостаточно данных для оценки риска простоя.</p>
+{% endif %}
+
+<h2>Нагрузка печати — прогноз</h2>
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>Метрика</th><th>Горизонт</th><th>Модель</th><th>WAPE</th><th>Прогноз (сумма за горизонт)</th>
+  </tr>
+  {% for metric, by_horizon in forecasts.load.items() %}
+    {% for horizon, f in by_horizon.items() %}
+    <tr>
+      <td>{{ metric }}</td>
+      <td>{{ horizon }} дней</td>
+      {% if f.insufficient_history %}
+      <td colspan="3" class="muted">Недостаточно данных (нужно история за {{ horizon }}+ дней)</td>
+      {% else %}
+      <td>{{ f.model_name }}</td>
+      <td>{{ "%.2f"|format(f.wape) if f.wape is not none else "—" }}</td>
+      <td>{{ "%.1f"|format(f.values | sum) }} ({{ "%.1f"|format(f.ci_lower | sum) }}–{{ "%.1f"|format(f.ci_upper | sum) }})</td>
+      {% endif %}
+    </tr>
+    {% endfor %}
+  {% endfor %}
+</table>
+</div>
+
+<h2>Активные и недавние ошибки</h2>
+{% if detail.alerts %}
+<table>
+  <tr><th>Тип</th><th>Важность</th><th>Сообщение</th><th>Открыт</th><th>Закрыт</th></tr>
+  {% for a in detail.alerts %}
+  <tr class="{% if not a.resolved_at %}status-error{% endif %}">
+    <td>{{ a.alert_type }}</td>
+    <td>{{ a.severity }}</td>
+    <td>{{ a.message or "" }}</td>
+    <td>{{ a.opened_at.strftime("%Y-%m-%d %H:%M") }}</td>
+    <td>{{ a.resolved_at.strftime("%Y-%m-%d %H:%M") if a.resolved_at else "—" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="empty-state">Ошибок не зафиксировано.</p>
+{% endif %}
+
+<h2>Связанные очереди</h2>
+{% if detail.linked_queues %}
+<table>
+  <tr><th>Очередь</th><th>Заданий за 30д</th><th>Страниц за 30д</th></tr>
+  {% for lq in detail.linked_queues %}
+  <tr>
+    <td><a href="/print-jobs?printer_name={{ lq.queue.printer_name | urlencode }}">{{ lq.queue.printer_name }}</a></td>
+    <td>{{ lq.jobs_period }}</td>
+    <td>{{ lq.pages_period }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="empty-state">Нет связанных очередей — см. /admin для управления привязкой.</p>
+{% endif %}
+
+<h2>Счётчик страниц (аппаратный), последние 90 дней</h2>
+<canvas id="counterChart" height="80"></canvas>
+<script>
+(function() {
+  var points = {{ counter_points_json | safe }};
+  if (!points.length) return;
+  var ctx = document.getElementById('counterChart').getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: points.map(function(p) { return p.collected_at.slice(0, 16).replace('T', ' '); }),
+      datasets: [{ label: 'Счётчик страниц', data: points.map(function(p) { return p.total_pages; }), borderColor: '#2563eb', tension: 0.2 }],
+    },
+    options: { scales: { x: { ticks: { maxTicksLimit: 10 } } } },
+  });
+})();
+</script>
+{% endblock %}

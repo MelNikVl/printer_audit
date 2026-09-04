@@ -31,7 +31,7 @@ from printaudit.ad_settings import validate_session_secret  # noqa: E402
 from printaudit.agent_settings import get_agent_settings  # noqa: E402
 from printaudit.config import get_settings  # noqa: E402
 from printaudit.models import AppUser, Department, PrintJob, PrintServer, Site  # noqa: E402
-from webapp import admin_routes, agent_api, auth_routes  # noqa: E402
+from webapp import admin_routes, agent_api, auth_routes, endpoint_api, printers_routes  # noqa: E402
 from webapp.deps import csrf_token, get_db, require_login  # noqa: E402
 from webapp.errors import Forbidden, MustChangePassword, NotAuthenticated  # noqa: E402
 from webapp.middleware import CsrfCookieMiddleware, TrustedProxyHeadersMiddleware  # noqa: E402
@@ -60,12 +60,15 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Print Audit", lifespan=lifespan)
 app.add_middleware(CsrfCookieMiddleware)
 app.add_middleware(agent_api.MaxBodySizeMiddleware)
+app.add_middleware(endpoint_api.MaxEndpointBodySizeMiddleware)
 app.add_middleware(TrustedProxyHeadersMiddleware)
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 app.include_router(auth_routes.router)
 app.include_router(admin_routes.router)
 app.include_router(agent_api.router)
+app.include_router(endpoint_api.router)
+app.include_router(printers_routes.router)
 
 
 def _is_api_path(path: str) -> bool:

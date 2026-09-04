@@ -31,6 +31,20 @@
   {% endif %}
 </div>
 
+<h2>Мониторинг принтеров</h2>
+<div class="cards">
+  <div class="card"><div class="value">{{ monitoring_summary.total_devices }}</div><div class="label">Устройств всего</div></div>
+  <div class="card"><div class="value status-online">{{ monitoring_summary.online }}</div><div class="label">Online</div></div>
+  <div class="card"><div class="value status-warning">{{ monitoring_summary.warning }}</div><div class="label">Warning</div></div>
+  <div class="card"><div class="value status-error">{{ monitoring_summary.error }}</div><div class="label">Error</div></div>
+  <div class="card"><div class="value status-offline">{{ monitoring_summary.offline }}</div><div class="label">Offline</div></div>
+  <div class="card"><div class="value">{{ monitoring_summary.low_toner_count }}</div><div class="label">Низкий тонер</div></div>
+  <div class="card"><div class="value">{{ monitoring_summary.active_errors_count }}</div><div class="label">С активными ошибками</div></div>
+  <div class="card"><div class="value">{{ monitoring_summary.no_data_count }}</div><div class="label">Без данных</div></div>
+  <div class="card"><div class="value">{{ monitoring_summary.sites_with_problems }}</div><div class="label">Площадок с проблемами</div></div>
+</div>
+<p class="muted"><a href="/printers">Перейти к списку принтеров →</a></p>
+
 <div class="two-col">
   <div>
     <h2>Последняя синхронизация AD</h2>

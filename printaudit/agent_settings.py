@@ -24,6 +24,11 @@ MODE_CENTRAL = "central"
 VALID_MODES = (MODE_STANDALONE, MODE_AGENT, MODE_CENTRAL)
 
 PROTOCOL_VERSION = 1
+# Версионируется ОТДЕЛЬНО от протокола заданий печати (PROTOCOL_VERSION) —
+# расширение состава мониторинговых данных не требует согласованного бампа
+# версии протокола заданий печати, и наоборот (см.
+# docs/PRINTER_MONITORING_FORECASTING.md, webapp/agent_api.py).
+MONITORING_PROTOCOL_VERSION = 1
 AGENT_VERSION = "1.0"
 
 

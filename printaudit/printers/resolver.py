@@ -54,27 +54,32 @@ class PriceResolution:
 
 
 def get_or_create_printer_queue(
-    session: Session, printer_name: str, print_server_id: Optional[int] = None
+    session: Session, printer_name: str, print_server_id: Optional[int] = None,
+    endpoint_agent_id: Optional[int] = None,
 ) -> PrinterQueue:
     """Если задание печатается через очередь, которую ещё не видел ни
     'Обнаружить очереди' (Get-Printer), ни этот резолвер — коллектор создаёт
     её сам как discovered_by_collector=True, unconfigured (color_mode=unknown,
     collection_enabled=True по умолчанию), не блокируя учёт.
 
-    Очередь ищется/создаётся В ПРЕДЕЛАХ print_server_id (см.
-    uq_printer_queues_server_name на PrinterQueue) — одноимённые очереди на
-    разных серверах/площадках больше не считаются одной и той же записью."""
+    Очередь ищется/создаётся В ПРЕДЕЛАХ ОДНОГО источника — print_server_id
+    (см. uq_printer_queues_server_name) ИЛИ endpoint_agent_id (см.
+    uq_printer_queues_endpoint_name на PrinterQueue), ровно один из двух —
+    одноимённые очереди/локальные принтеры на разных серверах/площадках/ПК
+    больше не считаются одной и той же записью (см.
+    docs/PRINTER_MONITORING_FORECASTING.md)."""
     printer_name = (printer_name or "").strip()
     now = datetime.now(timezone.utc)
     queue = (
         session.query(PrinterQueue)
-        .filter_by(printer_name=printer_name, print_server_id=print_server_id)
+        .filter_by(printer_name=printer_name, print_server_id=print_server_id, endpoint_agent_id=endpoint_agent_id)
         .first()
     )
     if queue is None:
         queue = PrinterQueue(
             printer_name=printer_name,
             print_server_id=print_server_id,
+            endpoint_agent_id=endpoint_agent_id,
             display_name=printer_name,
             first_seen_at=now,
             last_seen_at=now,

@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Принтеры</h1>
+<p class="muted">
+  Физические устройства (не очереди печати) — техническое состояние, расходники, активные ошибки.
+  Источник данных показан значком: <span class="badge badge-active">Zabbix</span> /
+  <span class="badge badge-active">SNMP</span> / <span class="badge badge-inactive">вручную/выкл.</span>.
+</p>
+
+<form class="filters" method="get">
+  <div>
+    <label>Площадка</label>
+    <select name="site_id">
+      <option value="">все</option>
+      {% for s in sites %}
+      <option value="{{ s.id }}" {% if site_id == s.id %}selected{% endif %}>{{ s.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label>Print Server</label>
+    <select name="print_server_id">
+      <option value="">все</option>
+      {% for ps in print_servers %}
+      <option value="{{ ps.id }}" {% if print_server_id == ps.id %}selected{% endif %}>{{ ps.display_name or ps.server_name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label>Статус</label>
+    <select name="status">
+      <option value="" {% if not status %}selected{% endif %}>любой</option>
+      <option value="online" {% if status == "online" %}selected{% endif %}>Online</option>
+      <option value="warning" {% if status == "warning" %}selected{% endif %}>Warning</option>
+      <option value="error" {% if status == "error" %}selected{% endif %}>Error</option>
+      <option value="offline" {% if status == "offline" %}selected{% endif %}>Offline</option>
+      <option value="unknown" {% if status == "unknown" %}selected{% endif %}>Unknown</option>
+    </select>
+  </div>
+  <div>
+    <label>Модель</label>
+    <select name="model">
+      <option value="">любая</option>
+      {% for m in models %}
+      <option value="{{ m }}" {% if model == m %}selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div>
+    <label>Источник мониторинга</label>
+    <select name="monitoring_source">
+      <option value="">любой</option>
+      <option value="zabbix_api" {% if monitoring_source == "zabbix_api" %}selected{% endif %}>Zabbix</option>
+      <option value="direct_snmp" {% if monitoring_source == "direct_snmp" %}selected{% endif %}>SNMP</option>
+      <option value="manual" {% if monitoring_source == "manual" %}selected{% endif %}>Вручную</option>
+      <option value="disabled" {% if monitoring_source == "disabled" %}selected{% endif %}>Выключен</option>
+    </select>
+  </div>
+  <div><label>Поиск</label><input type="text" name="q" value="{{ q }}" placeholder="имя, IP, hostname"></div>
+  <div><label><input type="checkbox" name="has_active_errors" value="true" {% if has_active_errors %}checked{% endif %}> Только с активными ошибками</label></div>
+  <div><label><input type="checkbox" name="low_supply_only" value="true" {% if low_supply_only %}checked{% endif %}> Только с низким расходником</label></div>
+  <div><label><input type="checkbox" name="no_data_only" value="true" {% if no_data_only %}checked{% endif %}> Только без данных</label></div>
+  <button type="submit">Применить</button>
+</form>
+
+<p class="muted">Найдено устройств: {{ rows | length }}</p>
+
+<div class="table-scroll">
+<table>
+  <tr>
+    <th>Устройство</th><th>Площадка</th><th>Статус</th><th>Источник</th><th>Расходники</th>
+    <th>Активные ошибки</th><th>Очередей</th><th>Заданий за 30д</th><th>Страниц за 30д</th><th>Последний контакт</th>
+  </tr>
+  {% for row in rows %}
+  <tr>
+    <td><a href="/printers/{{ row.device.id }}">{{ row.device.display_name }}</a></td>
+    <td>{{ row.device.site.name if row.device.site else "" }}</td>
+    <td><span class="status-{{ row.status }}">{{ row.status }}</span></td>
+    <td>
+      {% if row.device.monitoring_source == "zabbix_api" %}<span class="badge badge-active">Zabbix</span>
+      {% elif row.device.monitoring_source == "direct_snmp" %}<span class="badge badge-active">SNMP</span>
+      {% else %}<span class="badge badge-inactive">{{ row.device.monitoring_source }}</span>
+      {% endif %}
+    </td>
+    <td>
+      {% for s in row.supplies %}
+        <span title="{{ s.supply_type }}: {{ '%.0f'|format(s.level_percent) if s.level_percent is not none else 'неизвестно' }}%">
+          {{ s.supply_type }}
+          {% if s.level_percent is not none %}
+          <span class="supply-bar"><span class="supply-bar-fill {{ s.level_status }}" style="width: {{ s.level_percent }}%;"></span></span>
+          {% else %}?
+          {% endif %}
+        </span>
+      {% else %}—{% endfor %}
+    </td>
+    <td>{% if row.active_alert_count %}<span class="badge badge-missing">{{ row.active_alert_count }}</span>{% else %}0{% endif %}</td>
+    <td>{{ row.linked_queue_count }}</td>
+    <td>{{ row.jobs_period }}</td>
+    <td>{{ row.pages_period }}</td>
+    <td>{{ row.latest_health.collected_at.strftime("%Y-%m-%d %H:%M") if row.latest_health else "нет данных" }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="10" class="empty-state">Устройств не найдено по выбранным фильтрам</td></tr>
+  {% endfor %}
+</table>
+</div>
+{% endblock %}

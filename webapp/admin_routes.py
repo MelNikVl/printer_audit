@@ -34,14 +34,18 @@ from printaudit.models import (
     AppUser,
     CollectorState,
     Department,
+    EndpointAgent,
     PriceRule,
     PrinterQueue,
     PrintJob,
     PrintServer,
     Site,
+    SnmpProfile,
     SyncRun,
 )
 from printaudit.models import User as LegacyUser
+from printaudit.monitoring.device_queries import dashboard_summary
+from printaudit.monitoring.snmp_profiles import SnmpProfileError, create_snmp_profile, set_snmp_profile_active, update_snmp_profile
 from printaudit.printers.discovery import PrinterDiscoveryError, sync_printer_queues
 from printaudit.printers.resolver import resolve_price
 from printaudit.security.agent_tokens import generate_agent_token, hash_agent_token
@@ -97,6 +101,7 @@ def admin_overview(
         db.query(SyncRun).filter_by(status="failed").order_by(SyncRun.started_at.desc()).limit(5).all()
     )
     collector_states = db.query(CollectorState).all()
+    monitoring_summary = dashboard_summary(db)
 
     return templates.TemplateResponse(
         "admin/overview.html",
@@ -117,6 +122,7 @@ def admin_overview(
             "last_collector_run": last_collector_run,
             "collector_states": collector_states,
             "recent_failed_runs": recent_failed_runs,
+            "monitoring_summary": monitoring_summary,
         },
     )
 
@@ -1025,3 +1031,241 @@ def admin_print_servers_enable(
     )
     db.commit()
     return _redirect("/admin/print-servers", msg=f"Print Server «{server.server_name}» включён")
+
+
+# ---------------------------------------------------------------------------
+# Endpoint-агенты (USB/прямая печать на пользовательских ПК) — ЛОКАЛЬНЫЙ
+# раздел площадки (standalone/agent), не завязан на APP_MODE=central, см.
+# webapp/endpoint_api.py и docs/PRINTER_MONITORING_FORECASTING.md.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/endpoint-agents")
+def admin_endpoint_agents(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES))
+):
+    agents = db.query(EndpointAgent).order_by(EndpointAgent.hostname).all()
+    today_start = naive_utc(utcnow()).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = []
+    for agent in agents:
+        jobs_today = (
+            db.query(func.count(PrintJob.id))
+            .filter(PrintJob.endpoint_agent_id == agent.id, PrintJob.time_created >= today_start)
+            .scalar()
+            or 0
+        )
+        rows.append({"agent": agent, "status": compute_status(agent), "jobs_today": jobs_today})
+    return templates.TemplateResponse(
+        "admin/endpoint_agents.html",
+        {"request": request, "current_user": current_user, "csrf_token": csrf_token(request), "rows": rows},
+    )
+
+
+@router.post("/endpoint-agents/create", dependencies=[Depends(require_csrf)])
+def admin_endpoint_agents_create(
+    request: Request,
+    hostname: str = Form(...), display_name: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    hostname = hostname.strip()
+    if not hostname:
+        return _redirect("/admin/endpoint-agents", err="Имя компьютера обязательно")
+
+    settings = get_settings()
+    site = db.query(Site).filter_by(site_code=settings.site_code).first()
+    if site is None:
+        return _redirect(
+            "/admin/endpoint-agents",
+            err="Локальная площадка ещё не создана — запустите сборщик хотя бы раз (он заводит её сам).",
+        )
+    if db.query(EndpointAgent).filter_by(site_id=site.id, hostname=hostname).first():
+        return _redirect("/admin/endpoint-agents", err=f"Endpoint-агент «{hostname}» уже зарегистрирован")
+
+    raw_token = generate_agent_token()
+    agent = EndpointAgent(
+        site_id=site.id, hostname=hostname, display_name=display_name.strip() or hostname,
+        token_hash=hash_agent_token(raw_token), token_created_at=utcnow(),
+    )
+    db.add(agent)
+    db.flush()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="endpoint_agent.create", object_type="endpoint_agent",
+        object_id=agent.id, new_value={"hostname": hostname}, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect(
+        "/admin/endpoint-agents",
+        msg=(
+            f"Endpoint-агент «{hostname}» зарегистрирован. ENDPOINT_UUID={agent.uuid} "
+            f"ENDPOINT_TOKEN={raw_token} (токен показывается один раз — скопируйте обе строки "
+            f"в endpoint_agent.env на этом ПК)."
+        ),
+    )
+
+
+@router.post("/endpoint-agents/{agent_id}/rotate-token", dependencies=[Depends(require_csrf)])
+def admin_endpoint_agents_rotate_token(
+    agent_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    agent = db.get(EndpointAgent, agent_id)
+    if agent is None:
+        return _redirect("/admin/endpoint-agents", err="Endpoint-агент не найден")
+    raw_token = generate_agent_token()
+    agent.token_hash = hash_agent_token(raw_token)
+    agent.token_rotated_at = utcnow()
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="endpoint_agent.rotate_token", object_type="endpoint_agent",
+        object_id=agent.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect(
+        "/admin/endpoint-agents",
+        msg=f"Токен для «{agent.hostname}» перевыпущен (старый недействителен). Новый (один раз): {raw_token}",
+    )
+
+
+@router.post("/endpoint-agents/{agent_id}/disable", dependencies=[Depends(require_csrf)])
+def admin_endpoint_agents_disable(
+    agent_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    agent = db.get(EndpointAgent, agent_id)
+    if agent is None:
+        return _redirect("/admin/endpoint-agents", err="Endpoint-агент не найден")
+    agent.is_disabled = True
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="endpoint_agent.disable", object_type="endpoint_agent",
+        object_id=agent.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/endpoint-agents", msg=f"«{agent.hostname}» отключён — токен больше не принимается")
+
+
+@router.post("/endpoint-agents/{agent_id}/enable", dependencies=[Depends(require_csrf)])
+def admin_endpoint_agents_enable(
+    agent_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    agent = db.get(EndpointAgent, agent_id)
+    if agent is None:
+        return _redirect("/admin/endpoint-agents", err="Endpoint-агент не найден")
+    agent.is_disabled = False
+    audit_record(
+        db, actor_app_user_id=current_user.id, action="endpoint_agent.enable", object_type="endpoint_agent",
+        object_id=agent.id, ip_address=get_client_ip(request),
+    )
+    db.commit()
+    return _redirect("/admin/endpoint-agents", msg=f"«{agent.hostname}» включён")
+
+
+# ---------------------------------------------------------------------------
+# Профили SNMP (см. printaudit.monitoring.snmp_adapter, docs/PRINTER_MONITORING_FORECASTING.md)
+# ---------------------------------------------------------------------------
+
+
+def _snmp_profile_form_kwargs(
+    name: str, description: str, snmp_version: str, port: int, timeout_seconds: float, retries: int,
+    oid_map_json: str, credentials_env_var: str, snmp_v3_username: str, snmp_v3_auth_protocol: str,
+    snmp_v3_auth_key_env_var: str, snmp_v3_priv_protocol: str, snmp_v3_priv_key_env_var: str,
+) -> dict:
+    return dict(
+        name=name, description=description, snmp_version=snmp_version, port=port, timeout_seconds=timeout_seconds,
+        retries=retries, oid_map_json=oid_map_json, credentials_env_var=credentials_env_var or None,
+        snmp_v3_username=snmp_v3_username or None, snmp_v3_auth_protocol=snmp_v3_auth_protocol or None,
+        snmp_v3_auth_key_env_var=snmp_v3_auth_key_env_var or None, snmp_v3_priv_protocol=snmp_v3_priv_protocol or None,
+        snmp_v3_priv_key_env_var=snmp_v3_priv_key_env_var or None,
+    )
+
+
+@router.get("/snmp-profiles")
+def admin_snmp_profiles(
+    request: Request, db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    profiles = db.query(SnmpProfile).order_by(SnmpProfile.name).all()
+    return templates.TemplateResponse(
+        "admin/snmp_profiles.html",
+        {
+            "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
+            "profiles": profiles,
+        },
+    )
+
+
+@router.post("/snmp-profiles/create", dependencies=[Depends(require_csrf)])
+def admin_snmp_profiles_create(
+    request: Request,
+    name: str = Form(...), description: str = Form(""), snmp_version: str = Form("v3"),
+    port: int = Form(161), timeout_seconds: float = Form(2.0), retries: int = Form(1),
+    oid_map_json: str = Form("{}"), credentials_env_var: str = Form(""),
+    snmp_v3_username: str = Form(""), snmp_v3_auth_protocol: str = Form(""),
+    snmp_v3_auth_key_env_var: str = Form(""), snmp_v3_priv_protocol: str = Form(""),
+    snmp_v3_priv_key_env_var: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    kwargs = _snmp_profile_form_kwargs(
+        name, description, snmp_version, port, timeout_seconds, retries, oid_map_json, credentials_env_var,
+        snmp_v3_username, snmp_v3_auth_protocol, snmp_v3_auth_key_env_var, snmp_v3_priv_protocol,
+        snmp_v3_priv_key_env_var,
+    )
+    try:
+        profile = create_snmp_profile(db, actor=current_user, **kwargs)
+    except SnmpProfileError as exc:
+        db.rollback()
+        return _redirect("/admin/snmp-profiles", err=str(exc))
+    db.commit()
+    return _redirect("/admin/snmp-profiles", msg=f"Профиль SNMP «{profile.name}» создан")
+
+
+@router.post("/snmp-profiles/{profile_id}/update", dependencies=[Depends(require_csrf)])
+def admin_snmp_profiles_update(
+    profile_id: int, request: Request,
+    name: str = Form(...), description: str = Form(""), snmp_version: str = Form("v3"),
+    port: int = Form(161), timeout_seconds: float = Form(2.0), retries: int = Form(1),
+    oid_map_json: str = Form("{}"), credentials_env_var: str = Form(""),
+    snmp_v3_username: str = Form(""), snmp_v3_auth_protocol: str = Form(""),
+    snmp_v3_auth_key_env_var: str = Form(""), snmp_v3_priv_protocol: str = Form(""),
+    snmp_v3_priv_key_env_var: str = Form(""),
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    profile = db.get(SnmpProfile, profile_id)
+    if profile is None:
+        return _redirect("/admin/snmp-profiles", err="Профиль SNMP не найден")
+    kwargs = _snmp_profile_form_kwargs(
+        name, description, snmp_version, port, timeout_seconds, retries, oid_map_json, credentials_env_var,
+        snmp_v3_username, snmp_v3_auth_protocol, snmp_v3_auth_key_env_var, snmp_v3_priv_protocol,
+        snmp_v3_priv_key_env_var,
+    )
+    try:
+        update_snmp_profile(db, actor=current_user, profile=profile, **kwargs)
+    except SnmpProfileError as exc:
+        db.rollback()
+        return _redirect("/admin/snmp-profiles", err=str(exc))
+    db.commit()
+    return _redirect("/admin/snmp-profiles", msg=f"Профиль SNMP «{profile.name}» обновлён")
+
+
+@router.post("/snmp-profiles/{profile_id}/disable", dependencies=[Depends(require_csrf)])
+def admin_snmp_profiles_disable(
+    profile_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    profile = db.get(SnmpProfile, profile_id)
+    if profile is None:
+        return _redirect("/admin/snmp-profiles", err="Профиль SNMP не найден")
+    set_snmp_profile_active(db, actor=current_user, profile=profile, is_active=False)
+    db.commit()
+    return _redirect("/admin/snmp-profiles", msg=f"Профиль SNMP «{profile.name}» отключён")
+
+
+@router.post("/snmp-profiles/{profile_id}/enable", dependencies=[Depends(require_csrf)])
+def admin_snmp_profiles_enable(
+    profile_id: int, request: Request,
+    db: Session = Depends(get_db), current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
+):
+    profile = db.get(SnmpProfile, profile_id)
+    if profile is None:
+        return _redirect("/admin/snmp-profiles", err="Профиль SNMP не найден")
+    set_snmp_profile_active(db, actor=current_user, profile=profile, is_active=True)
+    db.commit()
+    return _redirect("/admin/snmp-profiles", msg=f"Профиль SNMP «{profile.name}» включён")

@@ -289,3 +289,190 @@ def test_migrate_copy_of_existing_multisite_database_preserves_everything(db_env
 
     with TestClient(main.app):
         pass
+
+
+def test_migrate_copy_of_pre_monitoring_database_to_head(db_env):
+    """То же требование ("проверь миграцию на копии существующей БД"),
+    но для ЭТОЙ ветки конкретно: строится на `d2a0ff9eb63d` — ревизии,
+    которая была head'ом ДО начала этой ветки (см. docstring
+    printaudit/agent_settings.py, printaudit/models.py) — то есть на
+    реалистичной "существующей в проде" БД от предыдущей ветки
+    (print-job-monitoring-multisite), без единой из новых таблиц
+    мониторинга/прогнозирования/endpoint-агентов. Проверяет: все 4 новые
+    ревизии применяются без ошибок; print_jobs/printer_queues не теряются
+    и не задваиваются; новые таблицы создаются пустыми и по схеме
+    совпадают с ORM; повторный upgrade идемпотентен; веб-интерфейс
+    открывается."""
+    database, db_path = db_env
+    cfg = _alembic_config()
+    command.upgrade(cfg, "d2a0ff9eb63d")
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO sites (uuid, site_code, name, is_active, created_at) "
+        "VALUES ('s1', 'ALMATY', 'Almaty', 1, '2026-08-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO print_servers (uuid, site_id, server_name, display_name, created_at, updated_at) "
+        "VALUES ('p1', 1, 'PRN01', 'PRN01', '2026-08-01T00:00:00', '2026-08-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO printer_queues (printer_name, print_server_id, is_active, is_shared, "
+        "is_published, color_mode, collection_enabled, first_seen_at, created_at, updated_at) "
+        "VALUES ('HP-BW', 1, 1, 0, 0, 'unknown', 1, '2026-08-01T00:00:00', '2026-08-01T00:00:00', '2026-08-01T00:00:00')"
+    )
+    for i in range(1, 16):
+        conn.execute(
+            "INSERT INTO print_jobs (site_code, site_id, print_server_id, printer_queue_id, record_id, "
+            "time_created, user_name, printer_name, total_pages, is_color, color_source, created_at) "
+            "VALUES ('ALMATY', 1, 1, 1, ?, '2026-08-01T10:00:00', 'DOMAIN\\ivanov', 'HP-BW', 5, NULL, "
+            "'unknown', '2026-08-01T10:00:01')",
+            (i,),
+        )
+    conn.commit()
+    before_jobs = conn.execute("SELECT count(*) FROM print_jobs").fetchone()[0]
+    before_queues = conn.execute("SELECT count(*) FROM printer_queues").fetchone()[0]
+    conn.close()
+    assert (before_jobs, before_queues) == (15, 1)
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT count(*) FROM print_jobs").fetchone()[0] == before_jobs
+        assert conn.execute("SELECT count(*) FROM printer_queues").fetchone()[0] == before_queues
+
+        row = conn.execute(
+            "SELECT record_id, printer_queue_id, endpoint_agent_id FROM print_jobs WHERE record_id = 10"
+        ).fetchone()
+        assert row == (10, 1, None)  # связь сохранена, новая колонка пуста (не задание endpoint-агента)
+
+        dupes = conn.execute(
+            "SELECT print_server_id, record_id, count(*) c FROM print_jobs "
+            "GROUP BY print_server_id, record_id HAVING c > 1"
+        ).fetchall()
+        assert dupes == []
+
+        new_tables = {
+            "snmp_profiles", "printer_devices", "printer_device_queue_links", "monitoring_runs",
+            "printer_health_samples", "printer_counter_samples", "printer_supply_samples",
+            "printer_alerts", "endpoint_agents", "forecast_runs", "printer_supply_daily_agg",
+            "monitoring_sync_state",
+        }
+        assert new_tables <= _all_tables(db_path)
+        for table in new_tables:
+            assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0  # пустые, не выдуманы данные
+
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(printer_queues)").fetchall()}
+        assert {"endpoint_agent_id"} <= cols
+    finally:
+        conn.close()
+
+    command.upgrade(cfg, "head")  # идемпотентность
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT count(*) FROM print_jobs").fetchone()[0] == before_jobs
+    finally:
+        conn.close()
+
+    from sqlalchemy import inspect
+
+    import printaudit.models  # noqa: F401
+
+    insp = inspect(database.engine)
+    db_tables = set(insp.get_table_names())
+    model_tables = set(database.Base.metadata.tables.keys())
+    for table in sorted(model_tables & {"printer_devices", "endpoint_agents", "forecast_runs", "printer_supply_daily_agg"}):
+        model_cols = {c.name for c in database.Base.metadata.tables[table].columns}
+        db_cols = {c["name"] for c in insp.get_columns(table)}
+        assert model_cols == db_cols, f"{table}: {model_cols} != {db_cols}"
+
+    import os
+
+    os.environ["SESSION_SECRET_KEY"] = "test-session-secret-not-for-production-" + "x" * 20
+    import webapp.main as main
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app):
+        pass
+
+
+def test_migrate_copy_of_database_with_old_snmp_and_sync_state_schema_to_head(db_env):
+    """Проверяет две самые новые ревизии (7c9d3e1a5b02 -- SNMPv3 USM-поля
+    snmp_profiles, b4f68a2c9d17 -- составной курсор алертов
+    monitoring_sync_state) на копии БД, уже содержащей СТАРУЮ схему этих
+    двух таблиц (до этого исправления): существующие snmp_profiles/
+    monitoring_sync_state строки не теряются, новые колонки добавляются
+    NULL/0 (не выдуманные значения), идемпотентно, веб открывается."""
+    database, db_path = db_env
+    cfg = _alembic_config()
+    command.upgrade(cfg, "cca38199a688")  # последняя ревизия ДО этого исправления
+
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        "INSERT INTO snmp_profiles (name, snmp_version, credentials_env_var, port, timeout_seconds, retries, "
+        "oid_map_json, is_active, created_at, updated_at) "
+        "VALUES ('Legacy-V2C', 'v2c', 'SNMP_CRED_LEGACY', 161, 2.0, 1, '{}', 1, "
+        "'2026-08-01T00:00:00', '2026-08-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO sites (uuid, site_code, name, is_active, created_at) "
+        "VALUES ('s1', 'ALMATY', 'Almaty', 1, '2026-08-01T00:00:00')"
+    )
+    conn.execute(
+        "INSERT INTO monitoring_sync_state (site_id, last_health_sample_id, last_counter_sample_id, "
+        "last_supply_sample_id, last_alert_synced_at) VALUES (1, 42, 7, 3, '2026-08-02T00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        profile = conn.execute(
+            "SELECT name, snmp_version, credentials_env_var, snmp_v3_username, snmp_v3_auth_protocol "
+            "FROM snmp_profiles WHERE name = 'Legacy-V2C'"
+        ).fetchone()
+        assert profile == ("Legacy-V2C", "v2c", "SNMP_CRED_LEGACY", None, None)  # старая строка сохранена, новые поля NULL
+
+        state = conn.execute(
+            "SELECT last_health_sample_id, last_counter_sample_id, last_supply_sample_id, "
+            "last_alert_synced_at, last_alert_synced_id FROM monitoring_sync_state WHERE site_id = 1"
+        ).fetchone()
+        assert state == (42, 7, 3, "2026-08-02T00:00:00", 0)  # существующие курсоры целы, новый = 0 (не выдуман)
+
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(snmp_profiles)").fetchall()}
+        assert {"snmp_v3_username", "snmp_v3_auth_protocol", "snmp_v3_auth_key_env_var", "snmp_v3_priv_protocol", "snmp_v3_priv_key_env_var"} <= cols
+    finally:
+        conn.close()
+
+    command.upgrade(cfg, "head")  # идемпотентность
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        assert conn.execute("SELECT count(*) FROM snmp_profiles WHERE name = 'Legacy-V2C'").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM monitoring_sync_state WHERE site_id = 1").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    from sqlalchemy import inspect
+
+    import printaudit.models  # noqa: F401
+
+    insp = inspect(database.engine)
+    model_tables = set(database.Base.metadata.tables.keys())
+    for table in ("snmp_profiles", "monitoring_sync_state"):
+        model_cols = {c.name for c in database.Base.metadata.tables[table].columns}
+        db_cols = {c["name"] for c in insp.get_columns(table)}
+        assert model_cols == db_cols, f"{table}: {model_cols} != {db_cols}"
+
+    import os
+
+    os.environ["SESSION_SECRET_KEY"] = "test-session-secret-not-for-production-" + "x" * 20
+    import webapp.main as main
+    from fastapi.testclient import TestClient
+
+    with TestClient(main.app):
+        pass
