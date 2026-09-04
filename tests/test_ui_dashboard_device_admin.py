@@ -49,12 +49,13 @@ def test_site_display_name_can_be_changed_without_changing_code(http_client):
 
 def test_admin_can_create_device_and_explicitly_link_queue(http_client):
     login_as(http_client, role="admin")
+    from printaudit.config import get_settings
     from printaudit.database import SessionLocal
     from printaudit.models import PrinterDevice, PrinterDeviceQueueLink, PrinterQueue
     from printaudit.sites import get_or_create_print_server, get_or_create_site
 
     session = SessionLocal()
-    site = get_or_create_site(session, "DEVICE-SITE", name="Device Site")
+    site = get_or_create_site(session, get_settings().site_code, name="Device Site")
     server = get_or_create_print_server(session, site, "PRINT-DEVICE")
     session.flush()
     queue = PrinterQueue(
@@ -94,13 +95,48 @@ def test_admin_can_create_device_and_explicitly_link_queue(http_client):
     session.close()
 
 
-def test_direct_snmp_device_requires_profile(http_client):
+def test_direct_snmp_device_requires_ip_address(http_client):
     login_as(http_client, role="admin")
+    from printaudit.config import get_settings
     from printaudit.database import SessionLocal
+    from printaudit.models import SnmpProfile
     from printaudit.sites import get_or_create_site
 
     session = SessionLocal()
-    site = get_or_create_site(session, "SNMP-VALIDATE", name="SNMP Validate")
+    site = get_or_create_site(session, get_settings().site_code, name="SNMP Validate")
+    profile = SnmpProfile(
+        name="SNMP test", snmp_version="v2c",
+        credentials_env_var="SNMP_TEST_SECRET", oid_map_json="{}",
+    )
+    session.add(profile)
+    session.commit()
+    site_id, profile_id = site.id, profile.id
+    session.close()
+
+    csrf = _csrf(http_client, "/admin/printers")
+    response = http_client.post(
+        "/admin/printer-devices/create",
+        data={
+            "csrf_token": csrf, "site_id": site_id, "display_name": "Hostname only",
+            "hostname": "printer.local", "monitoring_source": "direct_snmp",
+            "snmp_profile_id": profile_id,
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "err=" in response.headers["location"]
+
+
+def test_central_cannot_create_agent_side_monitoring_configuration(http_client, monkeypatch):
+    login_as(http_client, role="admin")
+    monkeypatch.setenv("APP_MODE", "central")
+    from printaudit.config import get_settings
+    from printaudit.database import SessionLocal
+    from printaudit.models import PrinterDevice
+    from printaudit.sites import get_or_create_site
+
+    session = SessionLocal()
+    site = get_or_create_site(session, get_settings().site_code, name="Central")
     session.commit()
     site_id = site.id
     session.close()
@@ -109,10 +145,14 @@ def test_direct_snmp_device_requires_profile(http_client):
     response = http_client.post(
         "/admin/printer-devices/create",
         data={
-            "csrf_token": csrf, "site_id": site_id, "display_name": "No profile",
-            "ip_address": "10.2.3.4", "monitoring_source": "direct_snmp",
+            "csrf_token": csrf, "site_id": site_id,
+            "display_name": "Must live on agent", "monitoring_source": "disabled",
         },
         follow_redirects=False,
     )
     assert response.status_code == 303
     assert "err=" in response.headers["location"]
+
+    session = SessionLocal()
+    assert session.query(PrinterDevice).filter_by(display_name="Must live on agent").count() == 0
+    session.close()
