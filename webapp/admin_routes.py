@@ -16,6 +16,7 @@ from printaudit import roles
 from printaudit.ad.client import ADClient, ADError
 from printaudit.ad_normalize import normalize_login
 from printaudit.ad_settings import AuthAvailability, get_ad_settings
+from printaudit.agent_settings import get_agent_settings
 from printaudit.admin_users import (
     AdminActionError,
     create_local_user,
@@ -712,7 +713,15 @@ def admin_printers(
         {
             "request": request, "current_user": current_user, "csrf_token": csrf_token(request),
             "queues": queues, "devices": devices, "device_links": device_links,
-            "sites": db.query(Site).filter_by(is_active=True).order_by(Site.name).all(),
+            "sites": (
+                db.query(Site)
+                .filter_by(site_code=get_settings().site_code, is_active=True)
+                .order_by(Site.name)
+                .all()
+                if get_agent_settings().mode != "central"
+                else []
+            ),
+            "allow_device_provisioning": get_agent_settings().mode != "central",
             "snmp_profiles": db.query(SnmpProfile).filter_by(is_active=True).order_by(SnmpProfile.name).all(),
         },
     )
@@ -742,9 +751,14 @@ def admin_printer_device_create(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
 ):
+    if get_agent_settings().mode == "central":
+        return _redirect(
+            "/admin/printers",
+            err="Устройство нужно создать на сервере его площадки: центр получает данные, но не отправляет конфигурацию агентам",
+        )
     site = db.get(Site, site_id)
-    if site is None or not site.is_active:
-        return _redirect("/admin/printers", err="Активная площадка не найдена")
+    if site is None or not site.is_active or site.site_code != get_settings().site_code:
+        return _redirect("/admin/printers", err="Можно настраивать устройства только текущей локальной площадки")
     queue = db.get(PrinterQueue, queue_id) if queue_id else None
     if queue_id and queue is None:
         return _redirect("/admin/printers", err="Очередь печати не найдена")
@@ -754,8 +768,8 @@ def admin_printer_device_create(
         profile = db.get(SnmpProfile, snmp_profile_id) if snmp_profile_id else None
         if profile is None or not profile.is_active:
             return _redirect("/admin/printers", err="Для прямого SNMP выберите активный профиль")
-        if not (ip_address.strip() or hostname.strip()):
-            return _redirect("/admin/printers", err="Для прямого SNMP укажите IP-адрес или имя узла")
+        if not ip_address.strip():
+            return _redirect("/admin/printers", err="Для прямого SNMP укажите IP-адрес")
     if monitoring_source == "zabbix_api" and not zabbix_host_id.strip():
         return _redirect("/admin/printers", err="Для Zabbix укажите ID хоста")
     try:
@@ -789,6 +803,8 @@ def admin_printer_device_source(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
 ):
+    if get_agent_settings().mode == "central":
+        return _redirect("/admin/printers", err="Источник мониторинга меняется на сервере площадки")
     device = db.get(PrinterDevice, device_id)
     if device is None:
         return _redirect("/admin/printers", err="Устройство не найдено")
@@ -796,8 +812,8 @@ def admin_printer_device_source(
         profile = db.get(SnmpProfile, snmp_profile_id) if snmp_profile_id else None
         if profile is None or not profile.is_active:
             return _redirect("/admin/printers", err="Для прямого SNMP выберите активный профиль")
-        if not (device.ip_address or device.hostname):
-            return _redirect("/admin/printers", err="У устройства нет IP-адреса или имени узла")
+        if not device.ip_address:
+            return _redirect("/admin/printers", err="У устройства нет IP-адреса")
     if monitoring_source == "zabbix_api" and not zabbix_host_id.strip():
         return _redirect("/admin/printers", err="Для Zabbix укажите ID хоста")
     try:
@@ -821,6 +837,8 @@ def admin_printer_device_link(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
 ):
+    if get_agent_settings().mode == "central":
+        return _redirect("/admin/printers", err="Связи очередей меняются на сервере площадки")
     device = db.get(PrinterDevice, device_id)
     queue = db.get(PrinterQueue, queue_id)
     if device is None or queue is None:
@@ -843,6 +861,8 @@ def admin_printer_device_unlink(
     db: Session = Depends(get_db),
     current_user: AppUser = Depends(require_role(*ADMIN_ROLES)),
 ):
+    if get_agent_settings().mode == "central":
+        return _redirect("/admin/printers", err="Связи очередей меняются на сервере площадки")
     link = db.get(PrinterDeviceQueueLink, link_id)
     if link is None:
         return _redirect("/admin/printers", err="Связь не найдена")
