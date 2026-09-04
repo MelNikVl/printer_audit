@@ -175,7 +175,9 @@ def dashboard(
     """Главная страница: тот же отчёт по пользователям, что и /by-user."""
     d_from, d_to, df, dt = date_filters(date_from, date_to)
     rows = queries.by_user(db, date_from=d_from, date_to=d_to, site_id=site_id)
-    totals = queries.totals(db, date_from=d_from, date_to=d_to, site_id=site_id)
+    totals = queries.totals(
+        db, date_from=d_from, date_to=d_to, department_id=department_id, site_id=site_id
+    )
     return templates.TemplateResponse(
         "by_user.html",
         {
