@@ -1,12 +1,148 @@
 {% extends "admin/base_admin.html" %}
 {% block admin_content %}
-<h1>Принтеры и очереди</h1>
+<h1>Принтеры и мониторинг</h1>
 
+<div class="info-panel">
+  <strong>Почему раньше было 0 устройств:</strong> очереди Windows нужны для учёта заданий печати, а физические
+  устройства нужны для SNMP/Zabbix-мониторинга. Они не объединяются автоматически, чтобы одинаковые имена или
+  смена IP не связали историю с неправильным принтером. Добавьте устройство и явно выберите его очередь.
+</div>
+
+<h2>Физические устройства ({{ devices|length }})</h2>
+{% if allow_device_provisioning %}
+<form class="filters" method="post" action="/admin/printer-devices/create">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div>
+    <label>Площадка</label>
+    <select name="site_id" required>
+      {% for s in sites %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}
+    </select>
+  </div>
+  <div><label>Название устройства</label><input type="text" name="display_name" required placeholder="HP M428, бухгалтерия"></div>
+  <div><label>IP-адрес</label><input type="text" name="ip_address" placeholder="10.1.20.45"></div>
+  <div><label>Имя узла</label><input type="text" name="hostname"></div>
+  <div><label>Производитель</label><input type="text" name="vendor" placeholder="HP"></div>
+  <div><label>Модель</label><input type="text" name="model"></div>
+  <div>
+    <label>Источник состояния</label>
+    <select name="monitoring_source">
+      <option value="disabled">пока не опрашивать</option>
+      <option value="direct_snmp">прямой SNMP</option>
+      <option value="zabbix_api">Zabbix</option>
+      <option value="manual">ручной</option>
+    </select>
+  </div>
+  <div>
+    <label>SNMP-профиль</label>
+    <select name="snmp_profile_id">
+      <option value="">—</option>
+      {% for p in snmp_profiles %}<option value="{{ p.id }}">{{ p.name }}</option>{% endfor %}
+    </select>
+  </div>
+  <div><label>Zabbix host ID</label><input type="text" name="zabbix_host_id"></div>
+  <div>
+    <label>Связать с очередью</label>
+    <select name="queue_id">
+      <option value="">позже</option>
+      {% for q in queues %}
+      <option value="{{ q.id }}">{{ q.display_name or q.printer_name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <button type="submit">Добавить устройство</button>
+</form>
+{% if not snmp_profiles %}
+<p class="muted">Для прямого SNMP сначала создайте профиль в разделе «Профили SNMP». Для Zabbix нужен ID хоста из Zabbix.</p>
+{% endif %}
+{% else %}
+<div class="info-panel">
+  Это центральный сервер: здесь устройства доступны только для просмотра. Создание устройства, выбор SNMP/Zabbix
+  и связь с очередью выполняются в веб-интерфейсе сервера соответствующей площадки; агент передаст показания в центр.
+</div>
+{% endif %}
+
+<div class="device-admin-list">
+{% for device in devices %}
+  <section class="device-admin-card">
+    <h3>{{ device.display_name }}
+      {% if device.last_status == "online" %}<span class="status-online">online</span>
+      {% elif device.last_status == "warning" %}<span class="status-warning">warning</span>
+      {% elif device.last_status in ("error", "offline") %}<span class="status-error">{{ device.last_status }}</span>
+      {% else %}<span class="status-unknown">нет данных</span>{% endif %}
+    </h3>
+    <div class="device-meta">
+      {{ device.site.name }} · {{ device.ip_address or device.hostname or "адрес не указан" }} ·
+      источник: <span class="mono">{{ device.monitoring_source }}</span>
+      {% if device.last_seen_at %} · последний ответ: {{ device.last_seen_at }}{% endif %}
+    </div>
+
+    {% if allow_device_provisioning %}
+    <form class="filters" method="post" action="/admin/printer-devices/{{ device.id }}/source">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div>
+        <label>Источник состояния</label>
+        <select name="monitoring_source">
+          <option value="disabled" {% if device.monitoring_source == "disabled" %}selected{% endif %}>не опрашивать</option>
+          <option value="direct_snmp" {% if device.monitoring_source == "direct_snmp" %}selected{% endif %}>прямой SNMP</option>
+          <option value="zabbix_api" {% if device.monitoring_source == "zabbix_api" %}selected{% endif %}>Zabbix</option>
+          <option value="manual" {% if device.monitoring_source == "manual" %}selected{% endif %}>ручной</option>
+        </select>
+      </div>
+      <div>
+        <label>SNMP-профиль</label>
+        <select name="snmp_profile_id">
+          <option value="">—</option>
+          {% for p in snmp_profiles %}<option value="{{ p.id }}" {% if device.snmp_profile_id == p.id %}selected{% endif %}>{{ p.name }}</option>{% endfor %}
+        </select>
+      </div>
+      <div><label>Zabbix host ID</label><input type="text" name="zabbix_host_id" value="{{ device.zabbix_host_id or '' }}"></div>
+      <button type="submit">Сохранить источник</button>
+    </form>
+
+    <div class="device-links">
+      <strong>Связанные очереди:</strong>
+      {% for link in device_links.get(device.id, []) %}
+      <span class="badge badge-active">{{ link.printer_queue.display_name or link.printer_queue.printer_name }}</span>
+      <form method="post" action="/admin/printer-devices/links/{{ link.id }}/unlink">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit">отвязать</button>
+      </form>
+      {% else %}
+      <span class="muted">нет</span>
+      {% endfor %}
+      <form class="filters" method="post" action="/admin/printer-devices/{{ device.id }}/link" style="margin:0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div>
+          <label>Добавить очередь</label>
+          <select name="queue_id" required>
+            {% for q in queues %}<option value="{{ q.id }}">{{ q.display_name or q.printer_name }}</option>{% endfor %}
+          </select>
+        </div>
+        <button type="submit">Связать</button>
+      </form>
+    </div>
+    {% endif %}
+  </section>
+{% else %}
+  <div class="empty-state">Физические устройства ещё не добавлены. Заполните форму выше — после этого счётчик мониторинга перестанет быть нулевым.</div>
+{% endfor %}
+</div>
+
+{% if allow_device_provisioning %}
+<p class="info-panel">
+  После настройки источника зарегистрируйте периодический опрос:
+  <span class="mono">.\deploy\register_monitor_printers_task.ps1</span>.
+  Само создание устройства включает его в реестр, а данные состояния появятся после первого успешного опроса.
+</p>
+{% endif %}
+
+<h2 class="section-heading">Очереди Windows ({{ queues|length }})</h2>
 <form method="post" action="/admin/printers/discover">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <button type="submit">Обнаружить / синхронизировать очереди (Get-Printer)</button>
 </form>
 
+<div class="table-scroll">
 <table>
   <tr>
     <th>Очередь</th><th>Отображаемое имя</th><th>Сервер</th><th>Статус Windows</th>
@@ -38,6 +174,7 @@
   <tr><td colspan="10" class="empty-state">Очередей пока нет — нажмите «Обнаружить очереди»</td></tr>
   {% endfor %}
 </table>
+</div>
 
 {% for q in queues %}
 <form id="pq-form-{{ q.id }}" method="post" action="/admin/printers/{{ q.id }}/update">
@@ -45,7 +182,7 @@
 </form>
 {% endfor %}
 
-<p style="color:#6b7280; font-size:13px">
+<p class="muted">
   Исчезнувшая из Get-Printer очередь помечается «пропала», но её строка и вся история печати сохраняются —
   ничего не удаляется автоматически.
 </p>

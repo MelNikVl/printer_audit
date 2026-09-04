@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Отчёт по пользователям</h1>
+<h1>Дашборд по пользователям</h1>
+<p class="muted">Ключевые показатели и активность пользователей за выбранный период.</p>
 
 <form class="filters" method="get">
   <div><label>С</label><input type="date" name="date_from" value="{{ date_from }}"></div>
@@ -18,6 +19,13 @@
   {% endif %}
   <button type="submit">Применить</button>
 </form>
+
+<div class="cards">
+  <div class="card"><div class="value">{{ totals.jobs }}</div><div class="label">Заданий печати</div></div>
+  <div class="card"><div class="value">{{ totals.pages }}</div><div class="label">Страниц</div></div>
+  <div class="card"><div class="value">{{ "%.2f"|format(totals.cost) }}</div><div class="label">Стоимость ({{ currency }})</div></div>
+  <div class="card"><div class="value">{{ rows|length }}</div><div class="label">Активных пользователей</div></div>
+</div>
 
 <div class="chart-wrap">
   <canvas id="chart" height="90"></canvas>
