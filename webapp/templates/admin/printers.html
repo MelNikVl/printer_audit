@@ -9,6 +9,7 @@
 </div>
 
 <h2>Физические устройства ({{ devices|length }})</h2>
+{% if allow_device_provisioning %}
 <form class="filters" method="post" action="/admin/printer-devices/create">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <div>
@@ -53,6 +54,12 @@
 {% if not snmp_profiles %}
 <p class="muted">Для прямого SNMP сначала создайте профиль в разделе «Профили SNMP». Для Zabbix нужен ID хоста из Zabbix.</p>
 {% endif %}
+{% else %}
+<div class="info-panel">
+  Это центральный сервер: здесь устройства доступны только для просмотра. Создание устройства, выбор SNMP/Zabbix
+  и связь с очередью выполняются в веб-интерфейсе сервера соответствующей площадки; агент передаст показания в центр.
+</div>
+{% endif %}
 
 <div class="device-admin-list">
 {% for device in devices %}
@@ -69,6 +76,7 @@
       {% if device.last_seen_at %} · последний ответ: {{ device.last_seen_at }}{% endif %}
     </div>
 
+    {% if allow_device_provisioning %}
     <form class="filters" method="post" action="/admin/printer-devices/{{ device.id }}/source">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <div>
@@ -113,17 +121,20 @@
         <button type="submit">Связать</button>
       </form>
     </div>
+    {% endif %}
   </section>
 {% else %}
   <div class="empty-state">Физические устройства ещё не добавлены. Заполните форму выше — после этого счётчик мониторинга перестанет быть нулевым.</div>
 {% endfor %}
 </div>
 
+{% if allow_device_provisioning %}
 <p class="info-panel">
   После настройки источника зарегистрируйте периодический опрос:
   <span class="mono">.\deploy\register_monitor_printers_task.ps1</span>.
   Само создание устройства включает его в реестр, а данные состояния появятся после первого успешного опроса.
 </p>
+{% endif %}
 
 <h2 class="section-heading">Очереди Windows ({{ queues|length }})</h2>
 <form method="post" action="/admin/printers/discover">
