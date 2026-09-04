@@ -1,21 +1,28 @@
 {% extends "admin/base_admin.html" %}
 {% block admin_content %}
 <h1>Площадки</h1>
+<p class="muted">site_code — постоянный технический идентификатор для синхронизации. Отображаемое название и описание можно менять.</p>
 
 <table>
-  <tr><th>site_code</th><th>Название</th><th>Описание</th><th>Активна</th><th>Создана</th></tr>
+  <tr><th>site_code</th><th>Название</th><th>Описание</th><th>Активна</th><th>Создана</th><th></th></tr>
   {% for s in sites %}
   <tr>
-    <td>{{ s.site_code }}</td>
-    <td>{{ s.name }}</td>
-    <td>{{ s.description or "" }}</td>
+    <td class="mono">{{ s.site_code }}</td>
+    <td><input type="text" name="name" form="site-form-{{ s.id }}" value="{{ s.name }}" required></td>
+    <td><input type="text" name="description" form="site-form-{{ s.id }}" value="{{ s.description or '' }}"></td>
     <td>{% if s.is_active %}<span class="badge badge-active">да</span>{% else %}<span class="badge badge-inactive">нет</span>{% endif %}</td>
     <td>{{ s.created_at.strftime("%Y-%m-%d") }}</td>
+    <td><button type="submit" form="site-form-{{ s.id }}">Сохранить</button></td>
   </tr>
   {% else %}
-  <tr><td colspan="5" class="empty-state">Площадок пока нет — standalone-коллектор создаёт свою автоматически при первом запуске</td></tr>
+  <tr><td colspan="6" class="empty-state">Площадок пока нет — standalone-коллектор создаёт свою автоматически при первом запуске</td></tr>
   {% endfor %}
 </table>
+{% for s in sites %}
+<form id="site-form-{{ s.id }}" method="post" action="/admin/sites/{{ s.id }}/update">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+</form>
+{% endfor %}
 
 <h2>Новая площадка</h2>
 <form class="filters" method="post" action="/admin/sites/create">
